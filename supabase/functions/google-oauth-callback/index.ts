@@ -85,6 +85,12 @@ function requireRpcUuid(value: unknown, operation: string): string {
   return value;
 }
 
+function normalizeGoogleByteCount(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return /^\d+$/.test(normalized) ? normalized : null;
+}
+
 /**
  * Reads Google's error response body and returns only the safe error fields.
  * The body can echo token material, so the raw body is never logged.
@@ -408,7 +414,10 @@ Deno.serve(async (req: Request) => {
     // `about.get` accepts the drive.file scope, so no extra OAuth scope is
     // needed to learn which account was just connected.
     const aboutUrl = new URL(DRIVE_ABOUT_URL);
-    aboutUrl.searchParams.set("fields", "user(emailAddress,displayName)");
+    aboutUrl.searchParams.set(
+      "fields",
+      "user(emailAddress,displayName),storageQuota(limit,usage)",
+    );
 
     log("info", OPERATION, {
       event: "google_userinfo_request",
@@ -438,9 +447,23 @@ Deno.serve(async (req: Request) => {
 
     const about = await aboutResponse.json() as {
       user?: { emailAddress?: string; displayName?: string };
+      storageQuota?: {
+        limit?: string | null;
+        usage?: string | null;
+      } | null;
     };
     const email = about.user?.emailAddress?.trim() ?? "";
     const displayName = about.user?.displayName?.trim() ?? "";
+    const storageLimit = normalizeGoogleByteCount(about.storageQuota?.limit);
+    const storageUsage = normalizeGoogleByteCount(about.storageQuota?.usage);
+    const storageAvailable = storageLimit !== null && storageUsage !== null
+      ? (() => {
+          const available = BigInt(storageLimit) - BigInt(storageUsage);
+          return (available >= 0n ? available : 0n).toString();
+        })()
+      : null;
+    const hasValidQuotaResponse =
+      about.storageQuota !== null && typeof about.storageQuota === "object";
 
     if (!email) {
       log("error", OPERATION, {
@@ -689,6 +712,54 @@ Deno.serve(async (req: Request) => {
         reason: refreshTokenStored ? "already_stored_atomically" : "no_new_refresh_token",
         userId,
         accountId,
+      });
+    }
+
+    if (hasValidQuotaResponse) {
+      const quotaPatch = {
+        storage_limit_bytes: storageLimit,
+        storage_used_bytes: storageUsage,
+        storage_available_bytes: storageAvailable,
+        last_quota_check_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      const { error: quotaError } = await admin
+        .from("drive_accounts")
+        .update(quotaPatch)
+        .eq("id", accountId);
+
+      if (quotaError) {
+        log("error", OPERATION, {
+          event: "drive_quota_sync",
+          result: "failure",
+          userId,
+          accountId,
+          email,
+          hasStorageLimit: storageLimit !== null,
+          hasStorageUsage: storageUsage !== null,
+          errorName: "PostgrestError",
+          errorMessage: quotaError.message,
+          ...dbErrorFields(quotaError),
+        });
+      } else {
+        log("info", OPERATION, {
+          event: "drive_quota_sync",
+          result: "success",
+          userId,
+          accountId,
+          email,
+          hasStorageLimit: storageLimit !== null,
+          hasStorageUsage: storageUsage !== null,
+        });
+      }
+    } else {
+      log("info", OPERATION, {
+        event: "drive_quota_sync",
+        result: "skipped",
+        userId,
+        accountId,
+        email,
+        reason: "quota_data_missing_from_successful_about_response",
       });
     }
 
