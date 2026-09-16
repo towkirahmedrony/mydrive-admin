@@ -34,22 +34,56 @@ function safeErrorFields(error: unknown): Record<string, unknown> {
 }
 
 /**
- * Reads the JSON error body returned by the Edge Function (if any) so the
- * admin sees the actionable server message. Never contains token material.
+ * Safe, non-secret description of a failed Edge Function invocation.
+ *
+ * Reads the JSON error body (function errors use `error`; the Supabase gateway
+ * uses `message`/`msg`/`code`) so a real cause is never masked by the generic
+ * client message. Never reads or returns token/header material.
  */
-async function extractServerError(error: unknown): Promise<string | null> {
+interface InvokeErrorInfo {
+  message: string | null;
+  status: number | null;
+  code: string | number | null;
+  name: string | null;
+}
+
+async function describeInvokeError(error: unknown): Promise<InvokeErrorInfo> {
+  const name = (error as Error)?.name ?? null;
   const context = (error as { context?: unknown } | null)?.context;
+
+  let status: number | null = null;
+  if (context && typeof (context as Response).status === "number") {
+    status = (context as Response).status;
+  }
+
+  let message: string | null = null;
+  let code: string | number | null = null;
+
   if (context && typeof (context as Response).json === "function") {
     try {
-      const body = await (context as Response).json();
-      if (body && typeof body.error === "string" && body.error.trim()) {
-        return body.error;
+      const body = (await (context as Response).json()) as Record<
+        string,
+        unknown
+      > | null;
+      if (body && typeof body === "object") {
+        for (const key of ["error", "message", "msg"] as const) {
+          const value = body[key];
+          if (typeof value === "string" && value.trim()) {
+            message = value;
+            break;
+          }
+        }
+        const rawCode = body.code;
+        if (typeof rawCode === "string" || typeof rawCode === "number") {
+          code = rawCode;
+        }
       }
     } catch {
-      // Fall through to the generic message below.
+      // Non-JSON body: fall through with the fields gathered so far.
     }
   }
-  return null;
+
+  return { message, status, code, name };
 }
 
 export default function ConnectGoogleDriveButton() {
@@ -64,34 +98,69 @@ export default function ConnectGoogleDriveButton() {
     logOAuthInitiate("info", { event: "initiation_started" });
 
     try {
+      // Record whether a user session exists (a boolean only — never the token)
+      // so an auth/session problem is visible without exposing credentials.
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+
       // Call the Edge Function to initiate Google OAuth.
       // The function verifies admin status server-side, generates a CSRF state,
       // stores it in the oauth_states table, and returns the Google authorization URL.
+      const FUNCTION_NAME = "google-oauth-initiate";
+      logOAuthInitiate("info", {
+        event: "functions_invoke_attempt",
+        functionName: FUNCTION_NAME,
+        hasSession: Boolean(session),
+      });
+
       const { data, error: invokeError } = await supabase.functions.invoke(
-        "google-oauth-initiate",
+        FUNCTION_NAME,
         {
           body: {},
         }
       );
 
       if (invokeError) {
-        const serverMessage = await extractServerError(invokeError);
+        const info = await describeInvokeError(invokeError);
         logOAuthInitiate("error", {
           event: "edge_function_failed",
+          functionName: FUNCTION_NAME,
           ...safeErrorFields(invokeError),
-          hasServerMessage: Boolean(serverMessage),
+          httpStatus: info.status,
+          errorCode: info.code,
+          hasServerMessage: Boolean(info.message),
         });
-        if (serverMessage) {
-          setError(serverMessage);
-        } else if (invokeError.message?.includes("Admin privileges required")) {
+
+        if (info.message) {
+          setError(info.message);
+        } else if (
+          invokeError.message?.includes("Admin privileges required")
+        ) {
           setError("Your account does not have administrator privileges.");
         } else if (
           invokeError.message?.includes("Authentication required") ||
           invokeError.message?.includes("Missing authorization")
         ) {
           setError("Please sign in again to connect Google Drive.");
+        } else if (info.status === 404) {
+          setError(
+            "The Google Drive connection service is unavailable (Edge Function not found or not deployed)."
+          );
+        } else if (info.status === 401 || info.status === 403) {
+          setError("Please sign in again to connect Google Drive.");
+        } else if (
+          invokeError.message?.includes("Failed to send a request")
+        ) {
+          setError(
+            "Could not reach the Google Drive connection service. Please check your connection and try again."
+          );
         } else {
-          setError("Failed to initiate Google Drive connection. Please try again.");
+          setError(
+            `Failed to initiate Google Drive connection${
+              info.status ? ` (HTTP ${info.status})` : ""
+            }. Please try again.`
+          );
         }
         return;
       }

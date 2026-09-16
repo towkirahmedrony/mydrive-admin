@@ -1,4 +1,3 @@
-import { serve } from "jsr:@std/http";
 import { corsHeaders, handleCors } from "../shared/cors.ts";
 import { getSupabaseAdmin, getSupabaseAuth } from "../shared/auth.ts";
 
@@ -92,7 +91,7 @@ function generateState(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-serve(async (req: Request) => {
+Deno.serve(async (req: Request) => {
   const OPERATION = "oauth_initiate";
 
   const corsResponse = handleCors(req);

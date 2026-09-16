@@ -36,15 +36,24 @@ function safeErrorFields(error: unknown): Record<string, unknown> {
 
 /**
  * Reads the JSON error body returned by the Edge Function (if any) so the
- * admin sees the actionable server message. Never contains token material.
+ * admin sees the actionable server message. Function errors use `error`; the
+ * Supabase gateway uses `message`/`msg`. Never contains token material.
  */
 async function extractServerError(error: unknown): Promise<string | null> {
   const context = (error as { context?: unknown } | null)?.context;
   if (context && typeof (context as Response).json === "function") {
     try {
-      const body = await (context as Response).json();
-      if (body && typeof body.error === "string" && body.error.trim()) {
-        return body.error;
+      const body = (await (context as Response).json()) as Record<
+        string,
+        unknown
+      > | null;
+      if (body && typeof body === "object") {
+        for (const key of ["error", "message", "msg"] as const) {
+          const value = body[key];
+          if (typeof value === "string" && value.trim()) {
+            return value;
+          }
+        }
       }
     } catch {
       // Fall through to the generic message below.

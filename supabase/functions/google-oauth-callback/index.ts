@@ -1,4 +1,3 @@
-import { serve } from "jsr:@std/http";
 import { corsHeaders, handleCors } from "../shared/cors.ts";
 import { getSupabaseAdmin } from "../shared/auth.ts";
 
@@ -133,7 +132,7 @@ async function writeAuditLog(
   }
 }
 
-serve(async (req: Request) => {
+Deno.serve(async (req: Request) => {
   const OPERATION = "oauth_callback";
 
   const corsResponse = handleCors(req);
