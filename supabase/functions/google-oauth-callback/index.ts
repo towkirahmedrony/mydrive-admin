@@ -275,12 +275,9 @@ serve(async (req: Request) => {
     let accountId: string;
 
     if (existingRow) {
-      // Preserve admin-controlled fields (enabled, priority, name, notes,
-      // storage, display_name) — only connection metadata is refreshed here.
+      // Preserve all other account data — only refresh the reconnect state
+      // using columns that exist in the live drive_accounts schema.
       const patch: Record<string, unknown> = {
-        connection_status: "connected",
-        last_error: null,
-        last_error_at: null,
         updated_at: now,
       };
       if (existingRow.status === "reauth_required") {
@@ -299,10 +296,7 @@ serve(async (req: Request) => {
       const insert = {
         google_email: email,
         name: displayName || email,
-        enabled: true,
         status: "active",
-        connection_status: "connected",
-        health_status: "unknown",
       };
 
       const { data: created, error: insertError } = await admin
@@ -355,9 +349,7 @@ serve(async (req: Request) => {
         await admin
           .from("drive_accounts")
           .update({
-            connection_status: "error",
-            last_error: "Failed to store Drive credentials",
-            last_error_at: new Date().toISOString(),
+            status: "error",
             updated_at: new Date().toISOString(),
           })
           .eq("id", accountId);
