@@ -1,0 +1,15 @@
+[project]
+# Reference: https://supabase.com/docs/guides/cli/configuring-the-supabase-cli
+
+[functions]
+# Edge Functions are invoked with the project's service role key locally
+# but never expose it to the client.
+
+[functions.google-oauth-initiate]
+# Requires authenticated admin user via Bearer token
+verify_jwt = true
+
+[functions.google-oauth-callback]
+# Called from admin panel client after Google redirects back.
+# Authentication is verified inside the function by looking up the oauth_states table.
+verify_jwt = false

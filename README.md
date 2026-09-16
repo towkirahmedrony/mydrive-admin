@@ -8,6 +8,84 @@ This repository is intentionally separate from the My Drive Android application.
 
 ---
 
+## Quick Start
+
+### Prerequisites
+
+- Node.js 18+ 
+- npm or yarn
+- Supabase project with the My Drive schema
+- Google Cloud OAuth credentials
+
+### Local Development
+
+1. Clone the repository
+2. Install dependencies:
+   ```bash
+   npm install
+   ```
+3. Create a `.env.local` file with your environment variables (see `ENV_VARIABLES.md`)
+4. Run the development server:
+   ```bash
+   npm run dev
+   ```
+5. Open http://localhost:3000
+
+### Environment Variables
+
+See `ENV_VARIABLES.md` for the complete list of required environment variables.
+
+**Frontend-safe (exposed to browser):**
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+
+**Server-only (never expose to browser):**
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+
+### Google OAuth Setup
+
+1. Create OAuth 2.0 credentials in Google Cloud Console
+2. Add authorized redirect URI:
+   - Development: `https://your-project.supabase.co/functions/v1/google-oauth-callback`
+   - Production: `https://your-project.supabase.co/functions/v1/google-oauth-callback`
+3. Set Supabase Edge Function secrets:
+   ```bash
+   supabase secrets set GOOGLE_CLIENT_ID=your-client-id
+   supabase secrets set GOOGLE_CLIENT_SECRET=your-client-secret
+   ```
+4. Deploy Edge Functions:
+   ```bash
+   supabase functions deploy google-oauth-initiate
+   supabase functions deploy google-oauth-callback
+   ```
+
+### Database Migration
+
+Apply the OAuth states migration:
+```bash
+supabase db push
+# or
+psql -f supabase/migrations/001_oauth_states_and_admin.sql
+```
+
+### Deployment
+
+**Vercel:**
+1. Connect your GitHub repository to Vercel
+2. Configure environment variables in Vercel dashboard
+3. Deploy automatically on push to main
+
+**Other Platforms:**
+- Ensure `npm run build` succeeds
+- Set all environment variables
+- Configure Node.js 18+ runtime
+
+---
+
+---
+
 1. Project Overview
 
 My Drive is an office/group-oriented Android media backup system.
@@ -1008,3 +1086,77 @@ The Admin Panel controls and monitors the backend.
                              Telegram              Google Drive
 
 This separation keeps the Android application lightweight, keeps credentials server-side, and allows the backend to manage multiple backup destinations independently.
+
+---
+
+## Implementation Report
+
+### Files Created/Modified
+
+| File | Status | Purpose |
+|---|---|---|
+| `supabase/functions/google-oauth-initiate/index.ts` | Created | Edge Function: initiates Google OAuth, returns auth URL |
+| `supabase/functions/google-oauth-callback/index.ts` | Created | Edge Function: exchanges code for tokens, stores encrypted refresh token |
+| `supabase/migrations/001_oauth_states_and_admin.sql` | Created | OAuth states table for CSRF protection |
+| `supabase/migrations/002_add_refresh_token_encrypted.sql` | Created | Adds encrypted token column to drive_accounts |
+| `supabase/config.toml` | Created | Local Edge Function dev config |
+| `src/app/admin/drive/page.tsx` | Modified | Excludes refresh_token_encrypted from browser query |
+| `src/app/admin/drive/callback/page.tsx` | Modified | Improved OAuth error handling |
+| `src/components/ConnectGoogleDriveButton.tsx` | Modified | Inline error feedback |
+| `src/components/DriveAccountCard.tsx` | Modified | Better error handling, disconnect safety |
+| `ENV_VARIABLES.md` | Modified | Added ENCRYPTION_KEY and ADMIN_CALLBACK_URL docs |
+
+### Database Migrations
+
+- **001**: Creates `oauth_states` table (CSRF protection, 10-min TTL, admin-only RLS)
+- **002**: Adds `refresh_token_encrypted` column to `drive_accounts`
+
+### Edge Functions
+
+- **`google-oauth-initiate`**: Admin auth → CSRF state → Google auth URL
+- **`google-oauth-callback`**: Validate state → Exchange code → Encrypt token → Store in drive_accounts
+
+### Environment Variables
+
+Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+Server: `SUPABASE_SERVICE_ROLE_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `ENCRYPTION_KEY`, `ADMIN_CALLBACK_URL`
+Edge Function secrets: Same server vars set via `supabase secrets set`
+
+### Google OAuth Redirect URI
+
+Development: `http://localhost:3000/admin/drive/callback`
+Production: `https://your-admin-domain.com/admin/drive/callback`
+
+### How to Run
+
+```bash
+npm install
+# Create .env.local with all required variables (see ENV_VARIABLES.md)
+supabase db push  # Apply migrations
+# Set Edge Function secrets via supabase secrets set ...
+# Deploy Edge Functions via supabase functions deploy ...
+npm run dev
+```
+
+### How to Deploy
+
+Vercel: Connect repo → Set env vars → Auto-deploy on push.
+Edge Functions: `supabase functions deploy google-oauth-initiate google-oauth-callback`
+Update `ADMIN_CALLBACK_URL` and Google Cloud Console redirect URI for production.
+
+### Security Considerations
+
+1. Refresh tokens encrypted with AES-256-GCM, never returned to browser
+2. Google Client Secret server-side only
+3. CSRF protection via random state tokens with 10-min expiry
+4. Admin auth checked server-side in middleware AND Edge Functions
+5. RLS: drive_accounts admin-only; encrypted column excluded from select queries
+6. No public admin signup
+7. Admin role re-verified at token exchange time
+
+### Schema Limitations Discovered
+
+1. `drive_accounts.refresh_token_secret_id` references nonexistent secret store → resolved with migration 002
+2. No `oauth_states` table → created in migration 001
+3. `private.is_admin()` exists in DB but admin panel uses equivalent `profiles.role` checks
+4. No key rotation for encryption key — if rotated, existing tokens become undecryptable
