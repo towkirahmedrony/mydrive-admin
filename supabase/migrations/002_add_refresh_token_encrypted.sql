@@ -1,19 +1,26 @@
--- Migration: Add encrypted refresh token storage to drive_accounts
--- The existing drive_accounts table has a refresh_token_secret_id column that
--- references a secret store, but no dedicated secrets table exists in the schema.
--- This migration adds a column to store the AES-256-GCM encrypted refresh token
--- directly on the drive_accounts table.
+-- Migration: SUPERSEDED — intentionally a no-op. Do not add columns here.
 --
--- SECURITY: This column is protected by the existing RLS policy on drive_accounts:
---   ALL: is_admin() only
--- No end-user can read or write this column.
--- The token is encrypted with a server-side ENCRYPTION_KEY (AES-256-GCM),
--- so even if the database is compromised, the plaintext token is not exposed.
-
-ALTER TABLE public.drive_accounts
-  ADD COLUMN IF NOT EXISTS refresh_token_encrypted text;
-
-COMMENT ON COLUMN public.drive_accounts.refresh_token_encrypted IS
-  'AES-256-GCM encrypted Google OAuth refresh token. '
-  'Encrypted with ENCRYPTION_KEY env var. '
-  'Never returned to the browser. Protected by drive_accounts RLS (admin only).';
+-- An earlier, parallel credential scheme proposed storing an application
+-- AES-256-GCM encrypted Google Drive refresh token in a new
+-- `drive_accounts.refresh_token_encrypted` column using an `ENCRYPTION_KEY`
+-- Edge Function secret.
+--
+-- That scheme is NOT part of the MyDrive backend architecture and is no longer
+-- used anywhere in this repository (google-oauth-callback included). The
+-- authoritative storage path is Supabase Vault:
+--
+--   google-oauth-callback
+--     -> admin_store_drive_refresh_token(p_drive_account_id, p_refresh_token)
+--     -> Supabase Vault
+--     -> drive_accounts.refresh_token_secret_id
+--     -> worker_lookup_drive_refresh_token()
+--     -> drive-replicate
+--
+-- This migration deliberately performs NO schema change:
+--   * it must not create `refresh_token_encrypted`
+--   * it must not introduce or depend on `ENCRYPTION_KEY`
+--   * it does NOT drop anything that may already exist in the live database
+--     (dropping columns is destructive and out of scope)
+--
+-- If `refresh_token_encrypted` exists in the live database it is simply
+-- unused; remove it manually only as a separate, reviewed operation.

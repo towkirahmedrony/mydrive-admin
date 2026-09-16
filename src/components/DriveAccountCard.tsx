@@ -4,8 +4,9 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
-// Note: refresh_token_encrypted is intentionally excluded from this interface.
-// Encrypted credentials must never be sent to the browser.
+// Note: credential material is intentionally absent from this interface.
+// Refresh tokens live in Supabase Vault; drive_accounts only holds the secret
+// reference (refresh_token_secret_id), which must never be sent to the browser.
 interface DriveAccount {
   id: string;
   name: string;

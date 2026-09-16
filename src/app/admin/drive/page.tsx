@@ -6,11 +6,12 @@ export default async function DriveAccountsPage() {
   const supabase = await createClient();
 
   // Fetch all drive accounts (admin-only via RLS).
-  // Explicitly exclude refresh_token_encrypted — encrypted secrets must not
-  // be returned to the browser, even though they are encrypted at rest.
+  // Secrets are never selected: the refresh token lives in Supabase Vault and
+  // drive_accounts only holds a secret *reference* (refresh_token_secret_id),
+  // which is intentionally not queried here either.
   const { data: accounts, error } = await supabase
     .from("drive_accounts")
-    .select("id, name, google_email, root_folder_id, priority, status, storage_limit_bytes, storage_used_bytes, storage_available_bytes, last_quota_check_at, created_at, updated_at")
+    .select("id, name, display_name, google_email, root_folder_id, priority, enabled, status, connection_status, health_status, storage_limit_bytes, storage_used_bytes, storage_available_bytes, last_quota_check_at, refresh_token_updated_at, created_at, updated_at")
     .order("created_at", { ascending: false });
 
   if (error) {

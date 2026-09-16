@@ -1,110 +1,142 @@
-import { serve } from "https://deno.land/std@0.177.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { serve } from "jsr:@std/http";
+import { corsHeaders, handleCors } from "../shared/cors.ts";
+import { getSupabaseAdmin, getSupabaseAuth } from "../shared/auth.ts";
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type",
-};
+/**
+ * google-oauth-initiate — starts the admin Google Drive OAuth connection flow.
+ *
+ * Security:
+ *   - requires a valid user JWT AND profiles.role = 'admin'
+ *   - generates a cryptographically random, single-use OAuth state and stores it
+ *     in oauth_states with a short TTL, bound to the initiating admin
+ *   - the Google Client Secret is NEVER handled here; only the public client id
+ *     is used to build the authorization URL
+ *   - no token, secret, or encryption key is returned to the browser
+ *
+ * Usage:
+ *   POST /functions/v1/google-oauth-initiate
+ *   Headers: Authorization: Bearer <admin user JWT>, apikey: <anon key>
+ *   Returns: { "url": "https://accounts.google.com/o/oauth2/v2/auth?..." }
+ */
+
+const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+
+// Minimum scope required by the drive-replicate worker. The worker only ever
+// lists, creates and uploads files/folders that this application itself
+// created (folder resolution + resumable uploads + duplicate guard), which is
+// exactly what `drive.file` grants. No broader Drive scope is requested.
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+
+// OAuth states are short-lived and single-use.
+const STATE_TTL_MINUTES = 10;
+
+function json(payload: unknown, status: number): Response {
+  return new Response(JSON.stringify(payload), {
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+    status,
+  });
+}
+
+/**
+ * The OAuth client id MUST be the same client the drive-replicate worker uses
+ * to refresh access tokens (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET),
+ * otherwise the stored refresh token cannot be exchanged for an access token.
+ */
+function getGoogleClientId(): string | null {
+  return Deno.env.get("GOOGLE_OAUTH_CLIENT_ID") ?? null;
+}
+
+/** 256 bits of cryptographic randomness, hex-encoded. */
+function generateState(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
 
 serve(async (req: Request) => {
-  // Handle CORS preflight
-  if (req.method === "OPTIONS") {
-    return new Response("ok", { headers: corsHeaders });
+  const corsResponse = handleCors(req);
+  if (corsResponse) return corsResponse;
+
+  if (req.method !== "POST") {
+    return json({ error: "Method not allowed" }, 405);
   }
 
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-    const googleClientId = Deno.env.get("GOOGLE_CLIENT_ID")!;
-
-    const supabase = createClient(supabaseUrl, supabaseServiceKey);
-
-    // Verify the user is authenticated and is an admin
-    const authHeader = req.headers.get("Authorization");
-    if (!authHeader) {
-      return new Response(
-        JSON.stringify({ error: "Missing authorization header" }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+    // 1. Authenticated admin (server-side, never trusted from the browser).
+    let userId: string;
+    try {
+      const { user } = await getSupabaseAuth(req);
+      userId = user.id;
+    } catch {
+      return json({ error: "Authentication required" }, 401);
     }
 
-    const token = authHeader.replace("Bearer ", "");
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser(token);
-
-    if (authError || !user) {
-      return new Response(
-        JSON.stringify({ error: "Invalid authentication" }),
-        { status: 401, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
-    }
-
-    // Check if user is admin via profiles table
-    const { data: profile, error: profileError } = await supabase
+    const admin = getSupabaseAdmin();
+    const { data: profile, error: profileError } = await admin
       .from("profiles")
       .select("role")
-      .eq("id", user.id)
-      .single();
+      .eq("id", userId)
+      .maybeSingle();
 
-    if (profileError || !profile || profile.role !== "admin") {
-      return new Response(
-        JSON.stringify({ error: "Admin access required" }),
-        { status: 403, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    if (profileError) {
+      throw new Error(`Admin check failed: ${profileError.message}`);
+    }
+    if ((profile as { role?: string } | null)?.role !== "admin") {
+      return json({ error: "Admin privileges required" }, 403);
+    }
+
+    // 2. Server configuration (fail clearly instead of guessing a URL).
+    const clientId = getGoogleClientId();
+    if (!clientId) {
+      console.error(
+        "google-oauth-initiate: GOOGLE_OAUTH_CLIENT_ID is not configured",
+      );
+      return json({ error: "Google OAuth is not configured on the server." }, 500);
+    }
+
+    const callbackUrl = Deno.env.get("ADMIN_CALLBACK_URL");
+    if (!callbackUrl) {
+      console.error(
+        "google-oauth-initiate: ADMIN_CALLBACK_URL is not configured",
+      );
+      return json(
+        { error: "Google OAuth callback URL is not configured on the server." },
+        500,
       );
     }
 
-    // Generate a cryptographically random state for CSRF protection
-    const state = crypto.randomUUID();
+    // 3. Single-use CSRF state bound to this admin.
+    const state = generateState();
+    const expiresAt = new Date(
+      Date.now() + STATE_TTL_MINUTES * 60 * 1000,
+    ).toISOString();
 
-    // Store the state in the oauth_states table for verification in the callback
-    const { error: stateError } = await supabase.from("oauth_states").insert({
-      user_id: user.id,
-      state: state,
-      created_at: new Date().toISOString(),
+    const { error: stateError } = await admin.from("oauth_states").insert({
+      user_id: userId,
+      state,
+      expires_at: expiresAt,
     });
 
     if (stateError) {
-      console.error("Error storing OAuth state:", stateError);
-      return new Response(
-        JSON.stringify({ error: "Failed to initiate OAuth flow" }),
-        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-      );
+      throw new Error(`Failed to persist OAuth state: ${stateError.message}`);
     }
 
-    // Build the Google OAuth authorization URL.
-    // The redirect_uri points to the admin panel's callback page, NOT back to this Edge Function.
-    // Google will redirect the user's browser to the admin panel callback with ?code=...&state=...
-    const adminCallbackUrl = Deno.env.get("ADMIN_CALLBACK_URL") ||
-      `${supabaseUrl.replace(".supabase.co", ".vercel.app")}/admin/drive/callback`;
-
-    const scope = "https://www.googleapis.com/auth/drive.file";
+    // 4. Server-side authorization URL. The redirect target is the Admin Panel
+    //    callback page (ADMIN_CALLBACK_URL), which receives ?code=&state= and
+    //    forwards them to google-oauth-callback for the server-side exchange.
     const params = new URLSearchParams({
-      client_id: googleClientId,
-      redirect_uri: adminCallbackUrl,
+      client_id: clientId,
+      redirect_uri: callbackUrl,
       response_type: "code",
-      scope: scope,
+      scope: DRIVE_SCOPE,
       access_type: "offline",
       prompt: "consent",
-      state: state,
+      state,
     });
 
-    const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-
-    return new Response(
-      JSON.stringify({ url: authUrl }),
-      {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      }
-    );
+    return json({ url: `${GOOGLE_AUTH_URL}?${params.toString()}` }, 200);
   } catch (error) {
-    console.error("OAuth initiation error:", error);
-    return new Response(
-      JSON.stringify({ error: "Internal server error" }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-    );
+    console.error("google-oauth-initiate failed:", (error as Error).message);
+    return json({ error: "Internal server error" }, 500);
   }
 });

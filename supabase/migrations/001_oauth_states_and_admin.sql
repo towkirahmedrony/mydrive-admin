@@ -1,6 +1,19 @@
--- Migration: Create OAuth states table and admin function
+-- Migration: OAuth states for the admin Google Drive connection flow.
+--
+-- Used by:
+--   supabase/functions/google-oauth-initiate  (INSERT state)
+--   supabase/functions/google-oauth-callback  (atomic DELETE/consume + cleanup)
+--
+-- Notes:
+--   * Idempotent: safe whether or not an earlier generation of this table
+--     already exists. Reuses the table if present; never drops existing data.
+--   * The live database is the source of truth. Inspect it before applying;
+--     do NOT replay this blindly if oauth_states already exists.
+--   * Follows the project convention for admin-only tables:
+--     RLS enabled with a private.is_admin() policy, and server-only RPC
+--     EXECUTE granted to service_role (never to authenticated/anon).
 
--- Create the oauth_states table for CSRF protection during OAuth flow
+-- Create the oauth_states table for single-use CSRF protection.
 CREATE TABLE IF NOT EXISTS public.oauth_states (
   id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
@@ -9,31 +22,33 @@ CREATE TABLE IF NOT EXISTS public.oauth_states (
   expires_at TIMESTAMPTZ DEFAULT (now() + INTERVAL '10 minutes') NOT NULL
 );
 
--- Add RLS policies for oauth_states (admin only)
+-- Upgrade path for a pre-existing table (no-ops on a fresh install).
+ALTER TABLE public.oauth_states ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now() NOT NULL;
+ALTER TABLE public.oauth_states ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ DEFAULT (now() + INTERVAL '10 minutes') NOT NULL;
+
+-- Admin-only access at the data layer (defense in depth; Edge Functions use
+-- the service role and bypass RLS).
 ALTER TABLE public.oauth_states ENABLE ROW LEVEL SECURITY;
 
--- Only admins can access oauth_states
-CREATE POLICY "Admins can manage oauth states" ON public.oauth_states
-  FOR ALL
-  TO authenticated
-  USING (
-    EXISTS (
-      SELECT 1 FROM public.profiles
-      WHERE profiles.id = auth.uid()
-      AND profiles.role = 'admin'
-    )
-  );
+DROP POLICY IF EXISTS "Admins can manage oauth states" ON public.oauth_states;
+DROP POLICY IF EXISTS oauth_states_admin_all ON public.oauth_states;
 
--- Create index for efficient state lookups
+CREATE POLICY oauth_states_admin_all ON public.oauth_states
+  FOR ALL
+  USING (private.is_admin())
+  WITH CHECK (private.is_admin());
+
+-- Indexes for state lookup and expiry cleanup.
 CREATE INDEX IF NOT EXISTS idx_oauth_states_state ON public.oauth_states(state);
 CREATE INDEX IF NOT EXISTS idx_oauth_states_user_id ON public.oauth_states(user_id);
 CREATE INDEX IF NOT EXISTS idx_oauth_states_expires_at ON public.oauth_states(expires_at);
 
--- Function to clean up expired OAuth states (can be called via pg_cron or Edge Function)
+-- Removes expired (unconsumed) states. Called by google-oauth-callback.
 CREATE OR REPLACE FUNCTION public.cleanup_expired_oauth_states()
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public, pg_temp
 AS $$
 BEGIN
   DELETE FROM public.oauth_states
@@ -41,32 +56,6 @@ BEGIN
 END;
 $$;
 
--- Create a scheduled job to clean up expired states every hour (requires pg_cron extension)
--- Uncomment if pg_cron is available:
--- SELECT cron.schedule(
---   'cleanup-oauth-states',
---   '0 * * * *',
---   'SELECT public.cleanup_expired_oauth_states()'
--- );
-
--- Grant execute permission to authenticated users (they'll call it via Edge Function)
-GRANT EXECUTE ON FUNCTION public.cleanup_expired_oauth_states() TO authenticated;
-
--- Note: The private.is_admin() function is already used in the existing schema
--- as referenced in MYDRIVE_SCHEMA.md. This migration assumes it exists.
--- If it doesn't exist, you'll need to create it:
---
--- CREATE OR REPLACE FUNCTION public.is_admin()
--- RETURNS BOOLEAN
--- LANGUAGE plpgsql
--- SECURITY DEFINER
--- AS $$
--- DECLARE
---   user_role TEXT;
--- BEGIN
---   SELECT role INTO user_role
---   FROM public.profiles
---   WHERE id = auth.uid();
---   RETURN user_role = 'admin';
--- END;
--- $$;
+-- Backend (service_role) only, mirroring the drive_router_folders migration.
+REVOKE ALL ON FUNCTION public.cleanup_expired_oauth_states() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.cleanup_expired_oauth_states() TO service_role;

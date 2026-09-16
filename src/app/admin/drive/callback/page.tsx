@@ -4,6 +4,25 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
+/**
+ * Reads the JSON error body returned by the Edge Function (if any) so the
+ * admin sees the actionable server message. Never contains token material.
+ */
+async function extractServerError(error: unknown): Promise<string | null> {
+  const context = (error as { context?: unknown } | null)?.context;
+  if (context && typeof (context as Response).json === "function") {
+    try {
+      const body = await (context as Response).json();
+      if (body && typeof body.error === "string" && body.error.trim()) {
+        return body.error;
+      }
+    } catch {
+      // Fall through to the generic message below.
+    }
+  }
+  return null;
+}
+
 function OAuthCallbackContent() {
   const [status, setStatus] = useState<"loading" | "success" | "error">(
     "loading"
@@ -58,23 +77,14 @@ function OAuthCallbackContent() {
         if (invokeError) {
           console.error("OAuth callback Edge Function error:", invokeError);
 
-          // Distinguish between different error types
-          if (invokeError.message?.includes("Invalid or expired state")) {
-            setStatus("error");
-            setMessage(
-              "The OAuth session has expired or is invalid. Please try connecting again."
-            );
-          } else if (invokeError.message?.includes("Admin access required")) {
-            setStatus("error");
-            setMessage(
-              "Your account no longer has administrator privileges."
-            );
-          } else {
-            setStatus("error");
-            setMessage(
+          // Prefer the server's actionable message (expired/invalid state,
+          // admin re-check, missing refresh token guidance, etc.).
+          const serverMessage = await extractServerError(invokeError);
+          setStatus("error");
+          setMessage(
+            serverMessage ??
               "Failed to complete Google Drive connection. The server encountered an error. Please try again."
-            );
-          }
+          );
           return;
         }
 
@@ -83,8 +93,9 @@ function OAuthCallbackContent() {
           setMessage(
             `Google Drive account ${data.email ? `(${data.email})` : ""} connected successfully!`
           );
-          // Redirect to the Drive Accounts page after a brief delay
+          // Refresh the account list, then return to the Drive Accounts page.
           setTimeout(() => {
+            router.refresh();
             router.push("/admin/drive");
           }, 2000);
         } else {

@@ -39,27 +39,35 @@ See `ENV_VARIABLES.md` for the complete list of required environment variables.
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
 
-**Server-only (never expose to browser):**
-- `SUPABASE_SERVICE_ROLE_KEY`
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
+**Server-only (Supabase Edge Function secrets, never expose to browser):**
+- `GOOGLE_OAUTH_CLIENT_ID`
+- `GOOGLE_OAUTH_CLIENT_SECRET`
+- `ADMIN_CALLBACK_URL`
 
 ### Google OAuth Setup
 
 1. Create OAuth 2.0 credentials in Google Cloud Console
-2. Add authorized redirect URI:
-   - Development: `https://your-project.supabase.co/functions/v1/google-oauth-callback`
-   - Production: `https://your-project.supabase.co/functions/v1/google-oauth-callback`
-3. Set Supabase Edge Function secrets:
+2. Add the authorized redirect URI. The browser is redirected to the Admin
+   Panel callback page (not the Edge Function URL):
+   - Development: `http://localhost:3000/admin/drive/callback`
+   - Production: `https://your-admin-domain.com/admin/drive/callback`
+3. Set Supabase Edge Function secrets (the same OAuth client used by
+   `drive-replicate` to refresh access tokens):
    ```bash
-   supabase secrets set GOOGLE_CLIENT_ID=your-client-id
-   supabase secrets set GOOGLE_CLIENT_SECRET=your-client-secret
+   supabase secrets set GOOGLE_OAUTH_CLIENT_ID=your-client-id
+   supabase secrets set GOOGLE_OAUTH_CLIENT_SECRET=your-client-secret
+   supabase secrets set ADMIN_CALLBACK_URL=https://your-admin-domain.com/admin/drive/callback
    ```
 4. Deploy Edge Functions:
    ```bash
    supabase functions deploy google-oauth-initiate
    supabase functions deploy google-oauth-callback
    ```
+
+The flow requests only the `https://www.googleapis.com/auth/drive.file` scope.
+The resulting refresh token is stored in Supabase Vault via
+`admin_store_drive_refresh_token()`; only the secret reference is kept on
+`drive_accounts`.
 
 ### Database Migration
 
@@ -883,16 +891,21 @@ Frontend-safe values may include values such as:
 NEXT_PUBLIC_SUPABASE_URL=
 NEXT_PUBLIC_SUPABASE_ANON_KEY=
 
-Server-only values may include:
+Server-only values (Supabase Edge Function secrets) may include:
 
-SUPABASE_SERVICE_ROLE_KEY=
-GOOGLE_CLIENT_ID=
-GOOGLE_CLIENT_SECRET=
+GOOGLE_OAUTH_CLIENT_ID=
+GOOGLE_OAUTH_CLIENT_SECRET=
+ADMIN_CALLBACK_URL=
 
 Actual secret storage should prefer Supabase Edge Function secrets when the operation is implemented there.
 
+Drive refresh tokens are NOT an environment variable: they are stored in
+Supabase Vault via `admin_store_drive_refresh_token()`. There is no
+`ENCRYPTION_KEY` in the Drive OAuth flow.
+
 Never use:
 
+NEXT_PUBLIC_GOOGLE_OAUTH_CLIENT_SECRET
 NEXT_PUBLIC_GOOGLE_CLIENT_SECRET
 NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY
 NEXT_PUBLIC_GOOGLE_REFRESH_TOKEN
@@ -903,19 +916,20 @@ or equivalent client-exposed secrets.
 
 28. Google OAuth Redirect URI
 
-The exact redirect URI must be based on the deployed environment.
+The exact redirect URI must be based on the deployed environment and is
+supplied to both Edge Functions by the single `ADMIN_CALLBACK_URL` secret.
 
-Development example:
+The browser is redirected to the Admin Panel callback page, which forwards
+`code` and `state` server-side to `google-oauth-callback`:
 
-http://localhost:3000/...
+Development: `http://localhost:3000/admin/drive/callback`
+Production: `https://<admin-domain>/admin/drive/callback`
 
-Production example:
+The Edge Function URL is not the Google redirect target.
 
-https://<admin-domain>/...
-
-The actual callback path must match the implementation.
-
-The final redirect URI must be registered in Google Cloud OAuth credentials.
+The same `ADMIN_CALLBACK_URL` is used for the authorization request and the
+token exchange, and the exact value must be registered in Google Cloud OAuth
+credentials.
 
 Do not hardcode a development callback as the production callback.
 
@@ -1095,68 +1109,87 @@ This separation keeps the Android application lightweight, keeps credentials ser
 
 | File | Status | Purpose |
 |---|---|---|
-| `supabase/functions/google-oauth-initiate/index.ts` | Created | Edge Function: initiates Google OAuth, returns auth URL |
-| `supabase/functions/google-oauth-callback/index.ts` | Created | Edge Function: exchanges code for tokens, stores encrypted refresh token |
-| `supabase/migrations/001_oauth_states_and_admin.sql` | Created | OAuth states table for CSRF protection |
-| `supabase/migrations/002_add_refresh_token_encrypted.sql` | Created | Adds encrypted token column to drive_accounts |
-| `supabase/config.toml` | Created | Local Edge Function dev config |
-| `src/app/admin/drive/page.tsx` | Modified | Excludes refresh_token_encrypted from browser query |
-| `src/app/admin/drive/callback/page.tsx` | Modified | Improved OAuth error handling |
-| `src/components/ConnectGoogleDriveButton.tsx` | Modified | Inline error feedback |
-| `src/components/DriveAccountCard.tsx` | Modified | Better error handling, disconnect safety |
-| `ENV_VARIABLES.md` | Modified | Added ENCRYPTION_KEY and ADMIN_CALLBACK_URL docs |
+| `supabase/functions/shared/cors.ts` | Created | Shared CORS headers/handler (matches backend) |
+| `supabase/functions/shared/auth.ts` | Created | Shared service-role + JWT auth helpers (matches backend) |
+| `supabase/functions/google-oauth-initiate/index.ts` | Rewritten | Admin auth → single-use state → Google auth URL |
+| `supabase/functions/google-oauth-callback/index.ts` | Rewritten | Atomic state consume → code exchange → Vault token storage |
+| `supabase/migrations/001_oauth_states_and_admin.sql` | Updated | Idempotent `oauth_states` + cleanup RPC, `private.is_admin()`, service_role grants |
+| `supabase/migrations/002_add_refresh_token_encrypted.sql` | Superseded | No-op tombstone; the parallel encryption scheme is removed |
+| `src/app/admin/drive/callback/page.tsx` | Modified | Surfaces server error messages; refreshes list on success |
+| `src/components/ConnectGoogleDriveButton.tsx` | Modified | Surfaces server config/auth errors |
+| `src/app/admin/drive/page.tsx` | Modified | Selects authoritative columns; no secret/encrypted-token reference |
+| `ENV_VARIABLES.md` | Rewritten | Vault-based storage, canonical secret names, redirect URI |
+| `README.md` | Modified | OAuth setup, redirect URI, env vars, implementation report |
 
 ### Database Migrations
 
-- **001**: Creates `oauth_states` table (CSRF protection, 10-min TTL, admin-only RLS)
-- **002**: Adds `refresh_token_encrypted` column to `drive_accounts`
+- **001**: `oauth_states` (10-min TTL, single-use) + `cleanup_expired_oauth_states()`,
+  admin-only RLS via `private.is_admin()`, RPC execute restricted to `service_role`.
+  Idempotent and safe to reuse if the table already exists.
+- **002**: Superseded — intentionally performs no schema change.
 
 ### Edge Functions
 
-- **`google-oauth-initiate`**: Admin auth → CSRF state → Google auth URL
-- **`google-oauth-callback`**: Validate state → Exchange code → Encrypt token → Store in drive_accounts
+- **`google-oauth-initiate`**: verify admin → generate 256-bit state (10-min TTL) →
+  return Google authorization URL. `verify_jwt = true`.
+- **`google-oauth-callback`**: atomically consume state → re-verify admin →
+  exchange code server-side → identify account via Drive `about.get` →
+  reconnect/insert `drive_accounts` → store token via
+  `admin_store_drive_refresh_token()`. `verify_jwt = false`.
+
+### Credential flow (unchanged, authoritative)
+
+```
+Google OAuth -> authorization code -> google-oauth-callback
+  -> admin_store_drive_refresh_token(p_drive_account_id, p_refresh_token)
+  -> Supabase Vault
+  -> drive_accounts.refresh_token_secret_id
+  -> worker_lookup_drive_refresh_token()
+  -> drive-replicate
+```
 
 ### Environment Variables
 
 Frontend: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-Server: `SUPABASE_SERVICE_ROLE_KEY`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `ENCRYPTION_KEY`, `ADMIN_CALLBACK_URL`
-Edge Function secrets: Same server vars set via `supabase secrets set`
+Edge Function secrets: `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `ADMIN_CALLBACK_URL`
+
+There is no `ENCRYPTION_KEY` in the Drive OAuth flow and no
+`refresh_token_encrypted` column is written.
+
+### Google OAuth Scope
+
+`https://www.googleapis.com/auth/drive.file` — the minimum scope required by
+`drive-replicate`, which only lists/creates/uploads files and folders created by
+this application. Account identity is read through Drive `about.get`, which
+accepts this scope, so no `email`/`profile` scope is needed.
 
 ### Google OAuth Redirect URI
 
 Development: `http://localhost:3000/admin/drive/callback`
 Production: `https://your-admin-domain.com/admin/drive/callback`
 
-### How to Run
-
-```bash
-npm install
-# Create .env.local with all required variables (see ENV_VARIABLES.md)
-supabase db push  # Apply migrations
-# Set Edge Function secrets via supabase secrets set ...
-# Deploy Edge Functions via supabase functions deploy ...
-npm run dev
-```
-
 ### How to Deploy
 
-Vercel: Connect repo → Set env vars → Auto-deploy on push.
-Edge Functions: `supabase functions deploy google-oauth-initiate google-oauth-callback`
-Update `ADMIN_CALLBACK_URL` and Google Cloud Console redirect URI for production.
+```bash
+# Edge Function secrets (same OAuth client the worker refreshes with)
+supabase secrets set GOOGLE_OAUTH_CLIENT_ID=...
+supabase secrets set GOOGLE_OAUTH_CLIENT_SECRET=...
+supabase secrets set ADMIN_CALLBACK_URL=https://your-admin-domain.com/admin/drive/callback
+
+# Apply migration 001 (inspect the live schema first; it is idempotent)
+supabase db push
+
+# Deploy Edge Functions
+supabase functions deploy google-oauth-initiate
+supabase functions deploy google-oauth-callback
+```
 
 ### Security Considerations
 
-1. Refresh tokens encrypted with AES-256-GCM, never returned to browser
+1. Refresh tokens stored only via `admin_store_drive_refresh_token()` (Vault)
 2. Google Client Secret server-side only
-3. CSRF protection via random state tokens with 10-min expiry
-4. Admin auth checked server-side in middleware AND Edge Functions
-5. RLS: drive_accounts admin-only; encrypted column excluded from select queries
+3. Single-use, 256-bit, 10-minute CSRF state consumed atomically (replay/race safe)
+4. Admin verified at initiation AND re-verified at callback
+5. RLS: `drive_accounts` admin-only; secret reference never returned to browser
 6. No public admin signup
-7. Admin role re-verified at token exchange time
-
-### Schema Limitations Discovered
-
-1. `drive_accounts.refresh_token_secret_id` references nonexistent secret store → resolved with migration 002
-2. No `oauth_states` table → created in migration 001
-3. `private.is_admin()` exists in DB but admin panel uses equivalent `profiles.role` checks
-4. No key rotation for encryption key — if rotated, existing tokens become undecryptable
+7. No token, access token, client secret, or Vault reference is logged or returned

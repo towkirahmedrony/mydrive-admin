@@ -3,6 +3,25 @@
 import { useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 
+/**
+ * Reads the JSON error body returned by the Edge Function (if any) so the
+ * admin sees the actionable server message. Never contains token material.
+ */
+async function extractServerError(error: unknown): Promise<string | null> {
+  const context = (error as { context?: unknown } | null)?.context;
+  if (context && typeof (context as Response).json === "function") {
+    try {
+      const body = await (context as Response).json();
+      if (body && typeof body.error === "string" && body.error.trim()) {
+        return body.error;
+      }
+    } catch {
+      // Fall through to the generic message below.
+    }
+  }
+  return null;
+}
+
 export default function ConnectGoogleDriveButton() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -26,9 +45,15 @@ export default function ConnectGoogleDriveButton() {
 
       if (invokeError) {
         console.error("OAuth initiation error:", invokeError);
-        if (invokeError.message?.includes("Admin access required")) {
+        const serverMessage = await extractServerError(invokeError);
+        if (serverMessage) {
+          setError(serverMessage);
+        } else if (invokeError.message?.includes("Admin privileges required")) {
           setError("Your account does not have administrator privileges.");
-        } else if (invokeError.message?.includes("Missing authorization")) {
+        } else if (
+          invokeError.message?.includes("Authentication required") ||
+          invokeError.message?.includes("Missing authorization")
+        ) {
           setError("Please sign in again to connect Google Drive.");
         } else {
           setError("Failed to initiate Google Drive connection. Please try again.");
