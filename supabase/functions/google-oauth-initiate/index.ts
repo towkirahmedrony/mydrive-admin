@@ -38,6 +38,45 @@ function json(payload: unknown, status: number): Response {
 }
 
 /**
+ * Structured, secret-free diagnostic logging.
+ *
+ * NEVER pass tokens, JWTs, authorization headers, OAuth codes, cookies,
+ * client secrets, encryption keys, or full session/user objects as fields.
+ */
+function log(
+  level: "info" | "error",
+  operation: string,
+  fields: Record<string, unknown> = {},
+): void {
+  const line = `[GoogleDrive][${operation}] ${JSON.stringify({
+    scope: "GoogleDrive",
+    operation,
+    timestamp: new Date().toISOString(),
+    ...fields,
+  })}`;
+  if (level === "error") {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+}
+
+/** Extracts the safe, structural fields of a Supabase/PostgREST error. */
+function dbErrorFields(
+  error:
+    | { code?: string | null; message?: string | null; details?: string | null; hint?: string | null }
+    | null
+    | undefined,
+): Record<string, unknown> {
+  return {
+    supabaseErrorCode: error?.code ?? null,
+    supabaseErrorMessage: error?.message ?? null,
+    supabaseErrorDetails: error?.details ?? null,
+    supabaseErrorHint: error?.hint ?? null,
+  };
+}
+
+/**
  * The OAuth client id MUST be the same client the drive-replicate worker uses
  * to refresh access tokens (GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET),
  * otherwise the stored refresh token cannot be exchanged for an access token.
@@ -54,20 +93,45 @@ function generateState(): string {
 }
 
 serve(async (req: Request) => {
+  const OPERATION = "oauth_initiate";
+
   const corsResponse = handleCors(req);
   if (corsResponse) return corsResponse;
 
+  log("info", OPERATION, { event: "request_received", method: req.method });
+
   if (req.method !== "POST") {
+    log("error", OPERATION, {
+      event: "method_not_allowed",
+      method: req.method,
+    });
     return json({ error: "Method not allowed" }, 405);
   }
 
+  // The id is a UUID and is safe to log; the JWT is never logged.
+  let userId: string | null = null;
+
   try {
     // 1. Authenticated admin (server-side, never trusted from the browser).
-    let userId: string;
+    const hasAuthorizationHeader = Boolean(req.headers.get("Authorization"));
     try {
       const { user } = await getSupabaseAuth(req);
       userId = user.id;
-    } catch {
+      log("info", OPERATION, {
+        event: "auth_validated",
+        result: "success",
+        hasAuthorizationHeader,
+        userId,
+      });
+    } catch (authError) {
+      log("error", OPERATION, {
+        event: "auth_validated",
+        result: "failure",
+        hasAuthorizationHeader,
+        userId: null,
+        errorName: (authError as Error)?.name ?? null,
+        errorMessage: (authError as Error)?.message ?? null,
+      });
       return json({ error: "Authentication required" }, 401);
     }
 
@@ -79,26 +143,48 @@ serve(async (req: Request) => {
       .maybeSingle();
 
     if (profileError) {
+      log("error", OPERATION, {
+        event: "admin_role_check",
+        result: "failure",
+        userId,
+        errorName: "PostgrestError",
+        errorMessage: profileError.message,
+        ...dbErrorFields(profileError),
+      });
       throw new Error(`Admin check failed: ${profileError.message}`);
     }
-    if ((profile as { role?: string } | null)?.role !== "admin") {
+
+    const isAdmin = (profile as { role?: string } | null)?.role === "admin";
+    log(isAdmin ? "info" : "error", OPERATION, {
+      event: "admin_role_check",
+      result: isAdmin ? "success" : "failure",
+      isAdmin,
+      userId,
+    });
+    if (!isAdmin) {
       return json({ error: "Admin privileges required" }, 403);
     }
 
     // 2. Server configuration (fail clearly instead of guessing a URL).
     const clientId = getGoogleClientId();
     if (!clientId) {
-      console.error(
-        "google-oauth-initiate: GOOGLE_OAUTH_CLIENT_ID is not configured",
-      );
+      log("error", OPERATION, {
+        event: "config_check",
+        result: "failure",
+        userId,
+        missingConfig: "GOOGLE_OAUTH_CLIENT_ID",
+      });
       return json({ error: "Google OAuth is not configured on the server." }, 500);
     }
 
     const callbackUrl = Deno.env.get("ADMIN_CALLBACK_URL");
     if (!callbackUrl) {
-      console.error(
-        "google-oauth-initiate: ADMIN_CALLBACK_URL is not configured",
-      );
+      log("error", OPERATION, {
+        event: "config_check",
+        result: "failure",
+        userId,
+        missingConfig: "ADMIN_CALLBACK_URL",
+      });
       return json(
         { error: "Google OAuth callback URL is not configured on the server." },
         500,
@@ -118,8 +204,23 @@ serve(async (req: Request) => {
     });
 
     if (stateError) {
+      log("error", OPERATION, {
+        event: "oauth_state_creation",
+        result: "failure",
+        userId,
+        errorName: "PostgrestError",
+        errorMessage: stateError.message,
+        ...dbErrorFields(stateError),
+      });
       throw new Error(`Failed to persist OAuth state: ${stateError.message}`);
     }
+
+    log("info", OPERATION, {
+      event: "oauth_state_creation",
+      result: "success",
+      userId,
+      expiresAt,
+    });
 
     // 4. Server-side authorization URL. The redirect target is the Admin Panel
     //    callback page (ADMIN_CALLBACK_URL), which receives ?code=&state= and
@@ -134,9 +235,21 @@ serve(async (req: Request) => {
       state,
     });
 
+    log("info", OPERATION, {
+      event: "authorization_url_generated",
+      result: "success",
+      userId,
+    });
+
     return json({ url: `${GOOGLE_AUTH_URL}?${params.toString()}` }, 200);
   } catch (error) {
-    console.error("google-oauth-initiate failed:", (error as Error).message);
+    log("error", OPERATION, {
+      event: "unexpected_exception",
+      result: "failure",
+      userId,
+      errorName: (error as Error)?.name ?? null,
+      errorMessage: (error as Error)?.message ?? null,
+    });
     return json({ error: "Internal server error" }, 500);
   }
 });

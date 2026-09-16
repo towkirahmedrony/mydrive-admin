@@ -40,6 +40,77 @@ function json(payload: unknown, status: number): Response {
 }
 
 /**
+ * Structured, secret-free diagnostic logging.
+ *
+ * NEVER pass the raw authorization code, access token, refresh token, client
+ * secret, authorization header, cookies, or full session/user objects.
+ * Booleans, ids, counts, HTTP statuses and provider error strings are safe.
+ */
+function log(
+  level: "info" | "error",
+  operation: string,
+  fields: Record<string, unknown> = {},
+): void {
+  const line = `[GoogleDrive][${operation}] ${JSON.stringify({
+    scope: "GoogleDrive",
+    operation,
+    timestamp: new Date().toISOString(),
+    ...fields,
+  })}`;
+  if (level === "error") {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+}
+
+/** Extracts the safe, structural fields of a Supabase/PostgREST error. */
+function dbErrorFields(
+  error:
+    | { code?: string | null; message?: string | null; details?: string | null; hint?: string | null }
+    | null
+    | undefined,
+): Record<string, unknown> {
+  return {
+    supabaseErrorCode: error?.code ?? null,
+    supabaseErrorMessage: error?.message ?? null,
+    supabaseErrorDetails: error?.details ?? null,
+    supabaseErrorHint: error?.hint ?? null,
+  };
+}
+
+/**
+ * Reads Google's error response body and returns only the safe error fields.
+ * The body can echo token material, so the raw body is never logged.
+ */
+async function googleErrorFields(
+  response: Response,
+): Promise<Record<string, unknown>> {
+  try {
+    const body = await response.json() as {
+      error?: string | { code?: number | string; message?: string; status?: string };
+      error_description?: string;
+    };
+    if (typeof body.error === "string") {
+      return {
+        googleError: body.error,
+        googleErrorDescription: body.error_description ?? null,
+      };
+    }
+    if (body.error && typeof body.error === "object") {
+      return {
+        googleErrorStatus: body.error.status ?? null,
+        googleErrorCode: body.error.code ?? null,
+        googleErrorMessage: body.error.message ?? null,
+      };
+    }
+  } catch {
+    // Response was not JSON; nothing safe to extract.
+  }
+  return {};
+}
+
+/**
  * Same OAuth client the drive-replicate worker uses to refresh access tokens.
  * Both halves MUST share one client, otherwise the stored refresh token is
  * unusable by the worker.
@@ -63,12 +134,20 @@ async function writeAuditLog(
 }
 
 serve(async (req: Request) => {
+  const OPERATION = "oauth_callback";
+
   const corsResponse = handleCors(req);
   if (corsResponse) return corsResponse;
 
+  log("info", OPERATION, { event: "callback_request_received", method: req.method });
+
   if (req.method !== "POST") {
+    log("error", OPERATION, { event: "method_not_allowed", method: req.method });
     return json({ error: "Method not allowed" }, 405);
   }
+
+  // The admin user id is a UUID and is safe to log; tokens/JWTs never are.
+  let userId: string | null = null;
 
   try {
     const admin = getSupabaseAdmin();
@@ -76,27 +155,52 @@ serve(async (req: Request) => {
     let body: Record<string, unknown>;
     try {
       body = await req.json();
-    } catch {
+    } catch (parseError) {
+      log("error", OPERATION, {
+        event: "body_parse",
+        result: "failure",
+        errorName: (parseError as Error)?.name ?? null,
+        errorMessage: (parseError as Error)?.message ?? null,
+      });
       return json({ error: "Invalid JSON body" }, 400);
     }
 
     const code = typeof body.code === "string" ? body.code.trim() : "";
     const state = typeof body.state === "string" ? body.state.trim() : "";
+
+    // Booleans only — never the raw code or state values.
+    log("info", OPERATION, {
+      event: "code_state_presence_check",
+      hasCode: code.length > 0,
+      hasState: state.length > 0,
+    });
+
     if (!code || !state) {
+      log("error", OPERATION, {
+        event: "code_state_presence_check",
+        result: "failure",
+        reason: "missing_code_or_state",
+      });
       return json({ error: "Missing code or state parameter" }, 400);
     }
 
     const credentials = getGoogleCredentials();
     if (!credentials) {
-      console.error(
-        "google-oauth-callback: GOOGLE_OAUTH_CLIENT_ID / GOOGLE_OAUTH_CLIENT_SECRET not configured",
-      );
+      log("error", OPERATION, {
+        event: "config_check",
+        result: "failure",
+        missingConfig: "GOOGLE_OAUTH_CLIENT_ID/GOOGLE_OAUTH_CLIENT_SECRET",
+      });
       return json({ error: "Google OAuth is not configured on the server." }, 500);
     }
 
     const callbackUrl = Deno.env.get("ADMIN_CALLBACK_URL");
     if (!callbackUrl) {
-      console.error("google-oauth-callback: ADMIN_CALLBACK_URL not configured");
+      log("error", OPERATION, {
+        event: "config_check",
+        result: "failure",
+        missingConfig: "ADMIN_CALLBACK_URL",
+      });
       return json(
         { error: "Google OAuth callback URL is not configured on the server." },
         500,
@@ -115,32 +219,68 @@ serve(async (req: Request) => {
       .select("user_id");
 
     if (consumeError) {
+      log("error", OPERATION, {
+        event: "oauth_state_consumption",
+        result: "failure",
+        errorName: "PostgrestError",
+        errorMessage: consumeError.message,
+        ...dbErrorFields(consumeError),
+      });
       throw new Error(`Failed to validate OAuth state: ${consumeError.message}`);
     }
+
+    log("info", OPERATION, {
+      event: "oauth_state_consumption",
+      result: "success",
+      consumedCount: consumed?.length ?? 0,
+    });
 
     if (!consumed || consumed.length === 0) {
       // Distinguish an expired-but-present state (clean it up) from an
       // unknown/forged/reused one, without leaking any other detail.
-      const { data: stale } = await admin
+      const { data: stale, error: staleError } = await admin
         .from("oauth_states")
         .select("expires_at")
         .eq("state", state)
         .maybeSingle();
 
+      log("info", OPERATION, {
+        event: "oauth_state_lookup",
+        result: staleError ? "failure" : "success",
+        staleFound: Boolean(stale),
+        ...(staleError ? dbErrorFields(staleError) : {}),
+      });
+
       if (stale) {
         await admin.from("oauth_states").delete().eq("state", state);
+        log("error", OPERATION, {
+          event: "oauth_state_validation",
+          result: "expired",
+          stateDeleted: true,
+        });
         return json(
           { error: "OAuth session expired. Please start the connection again." },
           400,
         );
       }
+
+      log("error", OPERATION, {
+        event: "oauth_state_validation",
+        result: "invalid",
+      });
       return json(
         { error: "Invalid OAuth state. Please start the connection again." },
         400,
       );
     }
 
-    const userId = (consumed[0] as { user_id: string }).user_id;
+    userId = (consumed[0] as { user_id: string }).user_id;
+
+    log("info", OPERATION, {
+      event: "oauth_state_validation",
+      result: "valid",
+      userId,
+    });
 
     // ── 2. Re-verify the initiating admin (role may have changed) ───────────
     const { data: profile, error: profileError } = await admin
@@ -150,9 +290,25 @@ serve(async (req: Request) => {
       .maybeSingle();
 
     if (profileError) {
+      log("error", OPERATION, {
+        event: "admin_verification",
+        result: "failure",
+        userId,
+        errorName: "PostgrestError",
+        errorMessage: profileError.message,
+        ...dbErrorFields(profileError),
+      });
       throw new Error(`Admin re-check failed: ${profileError.message}`);
     }
-    if ((profile as { role?: string } | null)?.role !== "admin") {
+
+    const isAdmin = (profile as { role?: string } | null)?.role === "admin";
+    log(isAdmin ? "info" : "error", OPERATION, {
+      event: "admin_verification",
+      result: isAdmin ? "success" : "failure",
+      isAdmin,
+      userId,
+    });
+    if (!isAdmin) {
       return json(
         { error: "Administrator privileges are required to connect a Drive account." },
         403,
@@ -160,6 +316,12 @@ serve(async (req: Request) => {
     }
 
     // ── 3. Exchange the authorization code server-side ─────────────────────
+    log("info", OPERATION, {
+      event: "google_token_exchange",
+      result: "started",
+      userId,
+    });
+
     const tokenResponse = await fetch(GOOGLE_TOKEN_URL, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -174,10 +336,15 @@ serve(async (req: Request) => {
     });
 
     if (!tokenResponse.ok) {
-      // Never log the response body: it can echo token material.
-      console.error(
-        `google-oauth-callback: token exchange failed (HTTP ${tokenResponse.status})`,
-      );
+      // Never log the response body verbatim: it can echo token material.
+      const safe = await googleErrorFields(tokenResponse);
+      log("error", OPERATION, {
+        event: "google_token_exchange",
+        result: "failure",
+        userId,
+        httpStatus: tokenResponse.status,
+        ...safe,
+      });
       return json(
         { error: "Failed to exchange the authorization code with Google." },
         502,
@@ -190,9 +357,13 @@ serve(async (req: Request) => {
     };
 
     if (!tokens.access_token) {
-      console.error(
-        "google-oauth-callback: token exchange returned no access token",
-      );
+      log("error", OPERATION, {
+        event: "google_token_exchange",
+        result: "failure",
+        userId,
+        httpStatus: tokenResponse.status,
+        reason: "no_access_token",
+      });
       return json({ error: "Google did not return an access token." }, 502);
     }
 
@@ -204,11 +375,27 @@ serve(async (req: Request) => {
         ? tokens.refresh_token
         : null;
 
+    // Booleans only — the token values are never logged.
+    log("info", OPERATION, {
+      event: "google_token_exchange",
+      result: "completed",
+      userId,
+      httpStatus: tokenResponse.status,
+      hasAccessToken: true,
+      hasRefreshToken: Boolean(refreshToken),
+    });
+
     // ── 4. Identify the Google account using the Drive API only ────────────
     // `about.get` accepts the drive.file scope, so no extra OAuth scope is
     // needed to learn which account was just connected.
     const aboutUrl = new URL(DRIVE_ABOUT_URL);
     aboutUrl.searchParams.set("fields", "user(emailAddress,displayName)");
+
+    log("info", OPERATION, {
+      event: "google_userinfo_request",
+      result: "started",
+      userId,
+    });
 
     const aboutResponse = await fetch(aboutUrl.toString(), {
       headers: { Authorization: `Bearer ${tokens.access_token}` },
@@ -216,9 +403,14 @@ serve(async (req: Request) => {
     });
 
     if (!aboutResponse.ok) {
-      console.error(
-        `google-oauth-callback: Drive about.get failed (HTTP ${aboutResponse.status})`,
-      );
+      const safe = await googleErrorFields(aboutResponse);
+      log("error", OPERATION, {
+        event: "google_userinfo_request",
+        result: "failure",
+        userId,
+        httpStatus: aboutResponse.status,
+        ...safe,
+      });
       return json(
         { error: "Failed to retrieve the Google account identity." },
         502,
@@ -232,12 +424,26 @@ serve(async (req: Request) => {
     const displayName = about.user?.displayName?.trim() ?? "";
 
     if (!email) {
-      console.error("google-oauth-callback: Drive about.get returned no email");
+      log("error", OPERATION, {
+        event: "google_userinfo_request",
+        result: "failure",
+        userId,
+        httpStatus: aboutResponse.status,
+        reason: "no_email",
+      });
       return json(
         { error: "Google did not return an account email address." },
         502,
       );
     }
+
+    log("info", OPERATION, {
+      event: "google_userinfo_request",
+      result: "completed",
+      userId,
+      httpStatus: aboutResponse.status,
+      email,
+    });
 
     // ── 5. Find an existing account (reconnect, never duplicate) ───────────
     const { data: existing, error: existingError } = await admin
@@ -247,6 +453,15 @@ serve(async (req: Request) => {
       .maybeSingle();
 
     if (existingError) {
+      log("error", OPERATION, {
+        event: "drive_account_lookup",
+        result: "failure",
+        userId,
+        email,
+        errorName: "PostgrestError",
+        errorMessage: existingError.message,
+        ...dbErrorFields(existingError),
+      });
       throw new Error(`Drive account lookup failed: ${existingError.message}`);
     }
 
@@ -258,9 +473,28 @@ serve(async (req: Request) => {
 
     const existingHasSecret = Boolean(existingRow?.refresh_token_secret_id);
 
+    log("info", OPERATION, {
+      event: "drive_account_lookup",
+      result: "success",
+      userId,
+      email,
+      existingAccountFound: Boolean(existingRow),
+      existingAccountId: existingRow?.id ?? null,
+      existingStatus: existingRow?.status ?? null,
+      existingHasSecret,
+      branch: existingRow ? "reconnect" : "new_account",
+    });
+
     // A brand-new account (or one without a credential) is useless without a
     // refresh token. Fail with an actionable message instead of storing nothing.
     if (!refreshToken && !existingHasSecret) {
+      log("error", OPERATION, {
+        event: "refresh_token_check",
+        result: "failure",
+        userId,
+        email,
+        reason: "missing_refresh_token_for_new_account",
+      });
       return json(
         {
           error:
@@ -289,9 +523,24 @@ serve(async (req: Request) => {
         .update(patch)
         .eq("id", existingRow.id);
       if (updateError) {
+        log("error", OPERATION, {
+          event: "drive_account_update",
+          result: "failure",
+          userId,
+          accountId: existingRow.id,
+          errorName: "PostgrestError",
+          errorMessage: updateError.message,
+          ...dbErrorFields(updateError),
+        });
         throw new Error(`Failed to update Drive account: ${updateError.message}`);
       }
       accountId = existingRow.id;
+      log("info", OPERATION, {
+        event: "drive_account_update",
+        result: "success",
+        userId,
+        accountId,
+      });
     } else {
       const insert = {
         google_email: email,
@@ -314,18 +563,48 @@ serve(async (req: Request) => {
             .eq("google_email", email)
             .maybeSingle();
           if (!raced) {
+            log("error", OPERATION, {
+              event: "drive_account_insert",
+              result: "failure",
+              userId,
+              email,
+              errorName: "PostgrestError",
+              errorMessage: insertError.message,
+              ...dbErrorFields(insertError),
+            });
             throw new Error(
               `Failed to create Drive account: ${insertError.message}`,
             );
           }
           accountId = (raced as { id: string }).id;
+          log("info", OPERATION, {
+            event: "drive_account_insert",
+            result: "recovered_from_race",
+            userId,
+            accountId,
+          });
         } else {
+          log("error", OPERATION, {
+            event: "drive_account_insert",
+            result: "failure",
+            userId,
+            email,
+            errorName: "PostgrestError",
+            errorMessage: insertError.message,
+            ...dbErrorFields(insertError),
+          });
           throw new Error(
             `Failed to create Drive account: ${insertError.message}`,
           );
         }
       } else {
         accountId = (created as { id: string }).id;
+        log("info", OPERATION, {
+          event: "drive_account_insert",
+          result: "success",
+          userId,
+          accountId,
+        });
       }
     }
 
@@ -333,6 +612,14 @@ serve(async (req: Request) => {
     // Only the secret reference is persisted on drive_accounts; the token
     // itself is never written here and never leaves the server.
     if (refreshToken) {
+      // The drive account UUID is safe to log.
+      log("info", OPERATION, {
+        event: "admin_store_drive_refresh_token",
+        result: "started",
+        userId,
+        accountId,
+      });
+
       const { error: rpcError } = await admin.rpc(
         "admin_store_drive_refresh_token",
         {
@@ -342,9 +629,15 @@ serve(async (req: Request) => {
       );
 
       if (rpcError) {
-        console.error(
-          `google-oauth-callback: credential storage failed for account ${accountId}`,
-        );
+        log("error", OPERATION, {
+          event: "admin_store_drive_refresh_token",
+          result: "failure",
+          userId,
+          accountId,
+          errorName: "PostgrestError",
+          errorMessage: rpcError.message,
+          ...dbErrorFields(rpcError),
+        });
         // Leave the row in a recoverable state without storing any token.
         await admin
           .from("drive_accounts")
@@ -359,6 +652,21 @@ serve(async (req: Request) => {
           500,
         );
       }
+
+      log("info", OPERATION, {
+        event: "admin_store_drive_refresh_token",
+        result: "success",
+        userId,
+        accountId,
+      });
+    } else {
+      log("info", OPERATION, {
+        event: "admin_store_drive_refresh_token",
+        result: "skipped",
+        reason: "no_new_refresh_token",
+        userId,
+        accountId,
+      });
     }
 
     await writeAuditLog(admin, {
@@ -374,9 +682,23 @@ serve(async (req: Request) => {
     });
 
     // ── 7. Success response — no token material is ever returned ───────────
+    log("info", OPERATION, {
+      event: "flow_completed",
+      result: "success",
+      userId,
+      accountId,
+      email,
+    });
+
     return json({ success: true, email }, 200);
   } catch (error) {
-    console.error("google-oauth-callback failed:", (error as Error).message);
+    log("error", OPERATION, {
+      event: "unexpected_exception",
+      result: "failure",
+      userId,
+      errorName: (error as Error)?.name ?? null,
+      errorMessage: (error as Error)?.message ?? null,
+    });
     return json({ error: "Internal server error" }, 500);
   }
 });

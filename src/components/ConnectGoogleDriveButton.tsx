@@ -4,6 +4,36 @@ import { useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 
 /**
+ * Browser-console diagnostic logging. Only safe, non-secret fields are ever
+ * included: never tokens, JWTs, authorization headers, OAuth codes, cookies,
+ * secrets, or full session/user objects.
+ */
+function logOAuthInitiate(
+  level: "info" | "error",
+  fields: Record<string, unknown>
+): void {
+  const line = `[GoogleDrive][oauth_initiate] ${JSON.stringify({
+    scope: "GoogleDrive",
+    operation: "oauth_initiate",
+    timestamp: new Date().toISOString(),
+    ...fields,
+  })}`;
+  if (level === "error") {
+    console.error(line);
+  } else {
+    console.info(line);
+  }
+}
+
+/** Safe error metadata for the console (name + message only). */
+function safeErrorFields(error: unknown): Record<string, unknown> {
+  return {
+    errorName: (error as Error)?.name ?? null,
+    errorMessage: (error as Error)?.message ?? null,
+  };
+}
+
+/**
  * Reads the JSON error body returned by the Edge Function (if any) so the
  * admin sees the actionable server message. Never contains token material.
  */
@@ -31,6 +61,7 @@ export default function ConnectGoogleDriveButton() {
   const handleConnect = async () => {
     setLoading(true);
     setError(null);
+    logOAuthInitiate("info", { event: "initiation_started" });
 
     try {
       // Call the Edge Function to initiate Google OAuth.
@@ -44,8 +75,12 @@ export default function ConnectGoogleDriveButton() {
       );
 
       if (invokeError) {
-        console.error("OAuth initiation error:", invokeError);
         const serverMessage = await extractServerError(invokeError);
+        logOAuthInitiate("error", {
+          event: "edge_function_failed",
+          ...safeErrorFields(invokeError),
+          hasServerMessage: Boolean(serverMessage),
+        });
         if (serverMessage) {
           setError(serverMessage);
         } else if (invokeError.message?.includes("Admin privileges required")) {
@@ -64,12 +99,24 @@ export default function ConnectGoogleDriveButton() {
       if (data?.url) {
         // Redirect the browser to Google's OAuth consent screen.
         // After authorization, Google redirects back to the admin panel callback page.
+        logOAuthInitiate("info", {
+          event: "authorization_url_received",
+          result: "success",
+        });
         window.location.href = data.url;
       } else {
+        logOAuthInitiate("error", {
+          event: "authorization_url_received",
+          result: "failure",
+          reason: "missing_url_in_response",
+        });
         setError("Failed to get OAuth URL from server. Please try again.");
       }
     } catch (err) {
-      console.error("Error initiating OAuth:", err);
+      logOAuthInitiate("error", {
+        event: "unexpected_exception",
+        ...safeErrorFields(err),
+      });
       setError("An unexpected error occurred. Please check your connection and try again.");
     } finally {
       setLoading(false);

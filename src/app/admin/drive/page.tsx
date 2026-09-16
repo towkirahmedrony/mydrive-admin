@@ -15,7 +15,40 @@ export default async function DriveAccountsPage() {
     .order("created_at", { ascending: false });
 
   if (error) {
-    console.error("Error fetching drive accounts:", error);
+    // Safe diagnostic logging only: Supabase error metadata and the
+    // authenticated user id (a UUID). Never log tokens, cookies, Authorization
+    // headers, session objects, or secrets.
+    let userId: string | null = null;
+    try {
+      const { data: userData } = await supabase.auth.getUser();
+      userId = userData.user?.id ?? null;
+    } catch {
+      userId = null;
+    }
+
+    console.error(
+      `[GoogleDrive][drive_accounts_fetch] ${JSON.stringify({
+        scope: "GoogleDrive",
+        operation: "drive_accounts_fetch",
+        event: "query_failed",
+        supabaseErrorCode: error.code ?? null,
+        supabaseErrorMessage: error.message ?? null,
+        supabaseErrorDetails: error.details ?? null,
+        supabaseErrorHint: error.hint ?? null,
+        userId,
+        timestamp: new Date().toISOString(),
+      })}`
+    );
+  } else {
+    console.info(
+      `[GoogleDrive][drive_accounts_fetch] ${JSON.stringify({
+        scope: "GoogleDrive",
+        operation: "drive_accounts_fetch",
+        event: "query_succeeded",
+        accountCount: accounts?.length ?? 0,
+        timestamp: new Date().toISOString(),
+      })}`
+    );
   }
 
   const safeAccounts = (accounts ?? []).map(({ refresh_token_secret_id, ...row }) => row);

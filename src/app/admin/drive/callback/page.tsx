@@ -5,6 +5,36 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 
 /**
+ * Browser-console diagnostic logging. Only safe, non-secret fields are ever
+ * included: never tokens, JWTs, authorization headers, OAuth codes, cookies,
+ * secrets, or full session/user objects.
+ */
+function logOAuthCallback(
+  level: "info" | "error",
+  fields: Record<string, unknown>
+): void {
+  const line = `[GoogleDrive][oauth_callback] ${JSON.stringify({
+    scope: "GoogleDrive",
+    operation: "oauth_callback",
+    timestamp: new Date().toISOString(),
+    ...fields,
+  })}`;
+  if (level === "error") {
+    console.error(line);
+  } else {
+    console.info(line);
+  }
+}
+
+/** Safe error metadata for the console (name + message only). */
+function safeErrorFields(error: unknown): Record<string, unknown> {
+  return {
+    errorName: (error as Error)?.name ?? null,
+    errorMessage: (error as Error)?.message ?? null,
+  };
+}
+
+/**
  * Reads the JSON error body returned by the Edge Function (if any) so the
  * admin sees the actionable server message. Never contains token material.
  */
@@ -39,8 +69,21 @@ function OAuthCallbackContent() {
       const error = searchParams.get("error");
       const errorDescription = searchParams.get("error_description");
 
+      // Booleans only — never log the raw code or state values.
+      logOAuthCallback("info", {
+        event: "callback_received",
+        hasCode: Boolean(code),
+        hasState: Boolean(state),
+        hasGoogleError: Boolean(error),
+      });
+
       // Handle Google OAuth errors (user denied, server error, etc.)
       if (error) {
+        logOAuthCallback("error", {
+          event: "google_returned_error",
+          googleError: error,
+          googleErrorDescription: errorDescription ?? null,
+        });
         setStatus("error");
         if (error === "access_denied") {
           setMessage("Authorization was denied. You can close this tab and return to the admin panel.");
@@ -56,6 +99,11 @@ function OAuthCallbackContent() {
 
       // Validate required parameters
       if (!code || !state) {
+        logOAuthCallback("error", {
+          event: "callback_parameters_validated",
+          result: "failure",
+          reason: "missing_code_or_state",
+        });
         setStatus("error");
         setMessage(
           "Invalid callback parameters. This may indicate a CSRF attack or an incomplete OAuth flow. Please try connecting again."
@@ -63,10 +111,16 @@ function OAuthCallbackContent() {
         return;
       }
 
+      logOAuthCallback("info", {
+        event: "callback_parameters_validated",
+        result: "success",
+      });
+
       try {
         // Forward the authorization code and state to the server-side Edge Function
         // for secure token exchange. The refresh token is handled entirely server-side
         // and never exposed to the browser.
+        logOAuthCallback("info", { event: "edge_function_invocation_started" });
         const { data, error: invokeError } = await supabase.functions.invoke(
           "google-oauth-callback",
           {
@@ -75,11 +129,14 @@ function OAuthCallbackContent() {
         );
 
         if (invokeError) {
-          console.error("OAuth callback Edge Function error:", invokeError);
-
           // Prefer the server's actionable message (expired/invalid state,
           // admin re-check, missing refresh token guidance, etc.).
           const serverMessage = await extractServerError(invokeError);
+          logOAuthCallback("error", {
+            event: "edge_function_failed",
+            ...safeErrorFields(invokeError),
+            hasServerMessage: Boolean(serverMessage),
+          });
           setStatus("error");
           setMessage(
             serverMessage ??
@@ -89,6 +146,11 @@ function OAuthCallbackContent() {
         }
 
         if (data?.success) {
+          logOAuthCallback("info", {
+            event: "flow_completed",
+            result: "success",
+            hasEmail: Boolean(data?.email),
+          });
           setStatus("success");
           setMessage(
             `Google Drive account ${data.email ? `(${data.email})` : ""} connected successfully!`
@@ -99,13 +161,21 @@ function OAuthCallbackContent() {
             router.push("/admin/drive");
           }, 2000);
         } else {
+          logOAuthCallback("error", {
+            event: "flow_completed",
+            result: "failure",
+            serverError: data?.error ?? null,
+          });
           setStatus("error");
           setMessage(
             data?.error || "Failed to connect Google Drive account. Please try again."
           );
         }
       } catch (err) {
-        console.error("Unexpected OAuth callback error:", err);
+        logOAuthCallback("error", {
+          event: "unexpected_exception",
+          ...safeErrorFields(err),
+        });
         setStatus("error");
         setMessage(
           "An unexpected error occurred while processing the OAuth callback. Please try again."
