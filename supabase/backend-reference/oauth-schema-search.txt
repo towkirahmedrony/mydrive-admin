@@ -1,0 +1,23 @@
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000400_drive_accounts_folders.sql:14:--     server-side secret (`refresh_token_secret_id` -> Supabase Vault) is
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000400_drive_accounts_folders.sql:37:    refresh_token_secret_id  uuid,
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:371:-- 3a. worker_lookup_drive_refresh_token()
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:374:CREATE OR REPLACE FUNCTION public.worker_lookup_drive_refresh_token(
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:429:-- 3b. admin_store_drive_refresh_token()
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:434:CREATE OR REPLACE FUNCTION public.admin_store_drive_refresh_token(
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:452:    SELECT refresh_token_secret_id
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:486:    SET refresh_token_secret_id  = v_secret_id,
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:520:              'worker_lookup_drive_refresh_token',
+/data/data/com.termux/files/home/drive/supabase/migrations/20260916000500_drive_router_folders.sql:521:              'admin_store_drive_refresh_token'
+/data/data/com.termux/files/home/drive/supabase/functions/README.md:144:Plus Drive account refresh tokens stored via `admin_store_drive_refresh_token()`
+/data/data/com.termux/files/home/drive/supabase/functions/README.md:146:`worker_lookup_drive_refresh_token()` from Supabase Vault.
+/data/data/com.termux/files/home/drive/supabase/functions/README.md:169:  `admin_store_drive_refresh_token()`; only the secret reference is stored on
+/data/data/com.termux/files/home/drive/supabase/functions/shared/drive-folders.ts:224:    .select("refresh_token_secret_id")
+/data/data/com.termux/files/home/drive/supabase/functions/shared/drive-folders.ts:232:    (account as { refresh_token_secret_id: string | null } | null)
+/data/data/com.termux/files/home/drive/supabase/functions/shared/drive-folders.ts:233:      ?.refresh_token_secret_id;
+/data/data/com.termux/files/home/drive/supabase/functions/shared/drive-folders.ts:239:    "worker_lookup_drive_refresh_token",
+/data/data/com.termux/files/home/drive/supabase/functions/drive-admin/index.ts:17: *     admin_store_drive_refresh_token() and only the secret reference is
+/data/data/com.termux/files/home/drive/supabase/functions/drive-admin/index.ts:35:// Includes refresh_token_secret_id so `has_refresh_token` can be computed;
+/data/data/com.termux/files/home/drive/supabase/functions/drive-admin/index.ts:42:  "refresh_token_secret_id",
+/data/data/com.termux/files/home/drive/supabase/functions/drive-admin/index.ts:95:  delete out.refresh_token_secret_id;
+/data/data/com.termux/files/home/drive/supabase/functions/drive-admin/index.ts:96:  out.has_refresh_token = Boolean(row.refresh_token_secret_id);
+/data/data/com.termux/files/home/drive/supabase/functions/drive-admin/index.ts:309:  const { error } = await admin.rpc("admin_store_drive_refresh_token", {
