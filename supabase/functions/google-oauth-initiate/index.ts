@@ -1,5 +1,5 @@
-import { corsHeaders, handleCors } from "../shared/cors.ts";
-import { getSupabaseAdmin, getSupabaseAuth } from "../shared/auth.ts";
+import { corsHeaders, handleCors } from "../_shared/cors.ts";
+import { getSupabaseAdmin, getSupabaseAuth } from "../_shared/auth.ts";
 
 /**
  * google-oauth-initiate — starts the admin Google Drive OAuth connection flow.
@@ -94,10 +94,24 @@ function generateState(): string {
 Deno.serve(async (req: Request) => {
   const OPERATION = "oauth_initiate";
 
-  const corsResponse = handleCors(req);
-  if (corsResponse) return corsResponse;
+  // Log FIRST, before the CORS preflight short-circuit: a browser invocation
+  // that never reaches this function (platform 404 / boot failure) produces no
+  // log line at all, so "preflight_answered" is the evidence that the browser
+  // request was actually routed here.
+  log("info", OPERATION, {
+    event: "request_received",
+    method: req.method,
+    isCorsPreflight: req.method === "OPTIONS",
+  });
 
-  log("info", OPERATION, { event: "request_received", method: req.method });
+  const corsResponse = handleCors(req);
+  if (corsResponse) {
+    log("info", OPERATION, {
+      event: "cors_preflight_answered",
+      result: "success",
+    });
+    return corsResponse;
+  }
 
   if (req.method !== "POST") {
     log("error", OPERATION, {

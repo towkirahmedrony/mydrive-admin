@@ -3,6 +3,9 @@
 import { useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 
+/** Name of the Edge Function that starts the Google OAuth flow. */
+const FUNCTION_NAME = "google-oauth-initiate";
+
 /**
  * Browser-console diagnostic logging. Only safe, non-secret fields are ever
  * included: never tokens, JWTs, authorization headers, OAuth codes, cookies,
@@ -25,6 +28,26 @@ function logOAuthInitiate(
   }
 }
 
+/**
+ * Resolves the exact URL `supabase.functions.invoke` will request.
+ *
+ * Mirrors the SDK's own derivation (SupabaseClient builds
+ * `new URL("functions/v1", supabaseUrl)`, then FunctionsClient appends the
+ * function name) so the logged endpoint is provably the one that was called.
+ * Contains only the public project URL and the function name — no key, no
+ * token, no secret.
+ */
+function resolveInvokeEndpoint(): string | null {
+  const base = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  if (!base) return null;
+  try {
+    const functionsUrl = new URL("functions/v1", base);
+    return new URL(`${functionsUrl.href}/${FUNCTION_NAME}`).href;
+  } catch {
+    return null;
+  }
+}
+
 /** Safe error metadata for the console (name + message only). */
 function safeErrorFields(error: unknown): Record<string, unknown> {
   return {
@@ -36,28 +59,52 @@ function safeErrorFields(error: unknown): Record<string, unknown> {
 /**
  * Safe, non-secret description of a failed Edge Function invocation.
  *
- * Reads the JSON error body (function errors use `error`; the Supabase gateway
- * uses `message`/`msg`/`code`) so a real cause is never masked by the generic
- * client message. Never reads or returns token/header material.
+ * `error.context` is a `Response` for HTTP/relay errors (so the platform or
+ * function JSON body can be read) and the raw fetch error for transport
+ * failures, where no status is available at all. Function errors use `error`;
+ * the Supabase platform uses `code` + `message` (e.g. `NOT_FOUND`,
+ * `NOT_FOUND_FUNCTION_BLOB`, `BOOT_ERROR`).
+ *
+ * Never reads or returns token/header material.
  */
 interface InvokeErrorInfo {
-  message: string | null;
-  status: number | null;
-  code: string | number | null;
+  /** SDK error class name: FunctionsFetchError | FunctionsHttpError | FunctionsRelayError. */
   name: string | null;
+  /** Message produced by the SDK itself. */
+  sdkMessage: string | null;
+  /** HTTP status, or null when no readable response was received. */
+  httpStatus: number | null;
+  /** Platform/function error code from the response body. */
+  serverCode: string | number | null;
+  /** Platform/function error message from the response body. */
+  serverMessage: string | null;
 }
+
+/**
+ * Turns a failed invocation into a single, actionable failure class so the
+ * console and the UI never flatten distinct causes into "check your connection".
+ */
+type FailureClass =
+  | "server_rejected"
+  | "authentication"
+  | "authorization"
+  | "function_not_deployed"
+  | "function_boot_error"
+  | "endpoint_unreachable"
+  | "unknown";
 
 async function describeInvokeError(error: unknown): Promise<InvokeErrorInfo> {
   const name = (error as Error)?.name ?? null;
+  const sdkMessage = (error as Error)?.message ?? null;
   const context = (error as { context?: unknown } | null)?.context;
 
-  let status: number | null = null;
+  let httpStatus: number | null = null;
   if (context && typeof (context as Response).status === "number") {
-    status = (context as Response).status;
+    httpStatus = (context as Response).status;
   }
 
-  let message: string | null = null;
-  let code: string | number | null = null;
+  let serverMessage: string | null = null;
+  let serverCode: string | number | null = null;
 
   if (context && typeof (context as Response).json === "function") {
     try {
@@ -69,13 +116,13 @@ async function describeInvokeError(error: unknown): Promise<InvokeErrorInfo> {
         for (const key of ["error", "message", "msg"] as const) {
           const value = body[key];
           if (typeof value === "string" && value.trim()) {
-            message = value;
+            serverMessage = value;
             break;
           }
         }
         const rawCode = body.code;
         if (typeof rawCode === "string" || typeof rawCode === "number") {
-          code = rawCode;
+          serverCode = rawCode;
         }
       }
     } catch {
@@ -83,7 +130,56 @@ async function describeInvokeError(error: unknown): Promise<InvokeErrorInfo> {
     }
   }
 
-  return { message, status, code, name };
+  return { name, sdkMessage, httpStatus, serverCode, serverMessage };
+}
+
+/**
+ * Classifies a failed invocation using both the SDK error and the server body.
+ *
+ * The `endpoint_unreachable` class is the important one: Supabase documents
+ * that the browser cannot observe platform 404s (the function name is not
+ * recognised, or its deployed bundle is missing) or boot-time 503s — browsers
+ * report them as CORS failures and the SDK collapses them into
+ * "Failed to send a request to the Edge Function". It is therefore NOT
+ * evidence of a client network problem.
+ */
+function classifyInvokeFailure(info: InvokeErrorInfo): FailureClass {
+  const text = `${info.sdkMessage ?? ""} ${info.serverMessage ?? ""}`.toLowerCase();
+  const code = String(info.serverCode ?? "").toUpperCase();
+
+  if (code === "NOT_FOUND" || code === "NOT_FOUND_FUNCTION_BLOB") {
+    return "function_not_deployed";
+  }
+  if (code === "BOOT_ERROR") {
+    return "function_boot_error";
+  }
+  if (text.includes("admin privileges required")) {
+    return "authorization";
+  }
+  if (
+    text.includes("authentication required") ||
+    text.includes("missing authorization") ||
+    text.includes("invalid or expired token")
+  ) {
+    return "authentication";
+  }
+  // A server body was readable, so the endpoint was reached and rejected us.
+  if (info.serverMessage) {
+    return "server_rejected";
+  }
+  if (info.httpStatus === 404) {
+    return "function_not_deployed";
+  }
+  if (info.httpStatus === 401 || info.httpStatus === 403) {
+    return "authentication";
+  }
+  if (info.httpStatus === 503) {
+    return "function_boot_error";
+  }
+  if (info.name === "FunctionsFetchError") {
+    return "endpoint_unreachable";
+  }
+  return "unknown";
 }
 
 export default function ConnectGoogleDriveButton() {
@@ -95,7 +191,19 @@ export default function ConnectGoogleDriveButton() {
   const handleConnect = async () => {
     setLoading(true);
     setError(null);
-    logOAuthInitiate("info", { event: "initiation_started" });
+
+    // 1. Button clicked.
+    logOAuthInitiate("info", {
+      event: "button_clicked",
+      functionName: FUNCTION_NAME,
+      resolvedEndpoint: resolveInvokeEndpoint(),
+      hasSupabaseUrlInBrowserBundle: Boolean(
+        process.env.NEXT_PUBLIC_SUPABASE_URL
+      ),
+      hasAnonKeyInBrowserBundle: Boolean(
+        process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY
+      ),
+    });
 
     try {
       // Record whether a user session exists (a boolean only — never the token)
@@ -104,13 +212,24 @@ export default function ConnectGoogleDriveButton() {
         data: { session },
       } = await supabase.auth.getSession();
 
-      // Call the Edge Function to initiate Google OAuth.
+      if (!session) {
+        // Not fatal on its own, but the function requires an admin JWT, so this
+        // is logged explicitly rather than silently falling through to a
+        // misleading network error later.
+        logOAuthInitiate("error", {
+          event: "session_missing",
+          functionName: FUNCTION_NAME,
+          hint: "The Edge Function requires a signed-in admin JWT.",
+        });
+      }
+
+      // 2. Invoke about to start.
       // The function verifies admin status server-side, generates a CSRF state,
       // stores it in the oauth_states table, and returns the Google authorization URL.
-      const FUNCTION_NAME = "google-oauth-initiate";
       logOAuthInitiate("info", {
-        event: "functions_invoke_attempt",
+        event: "invoke_starting",
         functionName: FUNCTION_NAME,
+        resolvedEndpoint: resolveInvokeEndpoint(),
         hasSession: Boolean(session),
       });
 
@@ -121,46 +240,70 @@ export default function ConnectGoogleDriveButton() {
         }
       );
 
+      // 3. Invoke returned.
+      logOAuthInitiate(invokeError ? "error" : "info", {
+        event: "invoke_returned",
+        functionName: FUNCTION_NAME,
+        result: invokeError ? "error" : "success",
+        hasData: Boolean(data),
+      });
+
       if (invokeError) {
+        // 4. Error details (HTTP / network / function).
         const info = await describeInvokeError(invokeError);
+        const failureClass = classifyInvokeFailure(info);
+
         logOAuthInitiate("error", {
-          event: "edge_function_failed",
+          event: "invoke_failed",
           functionName: FUNCTION_NAME,
+          resolvedEndpoint: resolveInvokeEndpoint(),
+          failureClass,
           ...safeErrorFields(invokeError),
-          httpStatus: info.status,
-          errorCode: info.code,
-          hasServerMessage: Boolean(info.message),
+          sdkErrorMessage: info.sdkMessage,
+          httpStatus: info.httpStatus,
+          serverErrorCode: info.serverCode,
+          serverErrorMessage: info.serverMessage,
         });
 
-        if (info.message) {
-          setError(info.message);
-        } else if (
-          invokeError.message?.includes("Admin privileges required")
-        ) {
-          setError("Your account does not have administrator privileges.");
-        } else if (
-          invokeError.message?.includes("Authentication required") ||
-          invokeError.message?.includes("Missing authorization")
-        ) {
-          setError("Please sign in again to connect Google Drive.");
-        } else if (info.status === 404) {
-          setError(
-            "The Google Drive connection service is unavailable (Edge Function not found or not deployed)."
-          );
-        } else if (info.status === 401 || info.status === 403) {
-          setError("Please sign in again to connect Google Drive.");
-        } else if (
-          invokeError.message?.includes("Failed to send a request")
-        ) {
-          setError(
-            "Could not reach the Google Drive connection service. Please check your connection and try again."
-          );
-        } else {
-          setError(
-            `Failed to initiate Google Drive connection${
-              info.status ? ` (HTTP ${info.status})` : ""
-            }. Please try again.`
-          );
+        switch (failureClass) {
+          case "function_not_deployed":
+            setError(
+              `The Google Drive connection service (Edge Function "${FUNCTION_NAME}") is not deployed on the Supabase project. ` +
+                "Redeploy it with `supabase functions deploy " +
+                FUNCTION_NAME +
+                "` and check Supabase → Edge Functions → Logs."
+            );
+            break;
+          case "function_boot_error":
+            setError(
+              `The Google Drive connection service (Edge Function "${FUNCTION_NAME}") failed to start. ` +
+                "Check Supabase → Edge Functions → Logs for a boot error and redeploy it."
+            );
+            break;
+          case "authorization":
+            setError("Your account does not have administrator privileges.");
+            break;
+          case "authentication":
+            setError("Please sign in again to connect Google Drive.");
+            break;
+          case "server_rejected":
+            setError(info.serverMessage ?? "The server rejected the request.");
+            break;
+          case "endpoint_unreachable":
+            setError(
+              `Could not reach the Google Drive connection service (Edge Function "${FUNCTION_NAME}"). ` +
+                "The browser received no readable response from the function endpoint, which is how a " +
+                "platform 404 (function not deployed, or its deployed bundle missing) and a boot-time 503 " +
+                "both appear — this is not evidence of a problem with your internet connection. " +
+                "Verify the deployment and check Supabase → Edge Functions → Logs."
+            );
+            break;
+          default:
+            setError(
+              `Failed to initiate Google Drive connection${
+                info.httpStatus ? ` (HTTP ${info.httpStatus})` : ""
+              }. Please try again.`
+            );
         }
         return;
       }
@@ -186,7 +329,9 @@ export default function ConnectGoogleDriveButton() {
         event: "unexpected_exception",
         ...safeErrorFields(err),
       });
-      setError("An unexpected error occurred. Please check your connection and try again.");
+      setError(
+        "An unexpected error occurred. Please check your connection and try again."
+      );
     } finally {
       setLoading(false);
     }

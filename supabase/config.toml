@@ -1,15 +1,20 @@
-[project]
-# Reference: https://supabase.com/docs/guides/cli/configuring-the-supabase-cli
-
-[functions]
-# Edge Functions are invoked with the project's service role key locally
-# but never expose it to the client.
+# Reference: https://supabase.com/docs/guides/local-development/cli/config
+#
+# The Supabase CLI resolves the project reference from this top-level key, from
+# `supabase link`, or from the `--project-ref` flag. It is deliberately left
+# unset here so no project ref is ever committed.
+# project_id = "your-project-ref"
+#
+# Note: `config.toml` has no `[project]` table and no bare `[functions]` table.
+# Function configuration is expressed per function as `[functions.<name>]`.
+# A malformed config makes every CLI command (including
+# `supabase functions deploy`) fail before it reaches the project.
 
 [functions.google-oauth-initiate]
-# Requires authenticated admin user via Bearer token
+# Requires an authenticated admin user via Bearer token.
 verify_jwt = true
 
 [functions.google-oauth-callback]
-# Called from admin panel client after Google redirects back.
+# Called from the admin panel client after Google redirects back.
 # Authentication is verified inside the function by looking up the oauth_states table.
 verify_jwt = false

@@ -1,5 +1,5 @@
-import { corsHeaders, handleCors } from "../shared/cors.ts";
-import { getSupabaseAdmin } from "../shared/auth.ts";
+import { corsHeaders, handleCors } from "../_shared/cors.ts";
+import { getSupabaseAdmin } from "../_shared/auth.ts";
 
 /**
  * google-oauth-callback — completes the admin Google Drive OAuth connection.
@@ -135,10 +135,23 @@ async function writeAuditLog(
 Deno.serve(async (req: Request) => {
   const OPERATION = "oauth_callback";
 
-  const corsResponse = handleCors(req);
-  if (corsResponse) return corsResponse;
+  // Log BEFORE the CORS preflight short-circuit so a request that is rejected
+  // by the platform (404 / boot failure) — which never reaches this function —
+  // is distinguishable from one that arrived and was answered here.
+  log("info", OPERATION, {
+    event: "callback_request_received",
+    method: req.method,
+    isCorsPreflight: req.method === "OPTIONS",
+  });
 
-  log("info", OPERATION, { event: "callback_request_received", method: req.method });
+  const corsResponse = handleCors(req);
+  if (corsResponse) {
+    log("info", OPERATION, {
+      event: "cors_preflight_answered",
+      result: "success",
+    });
+    return corsResponse;
+  }
 
   if (req.method !== "POST") {
     log("error", OPERATION, { event: "method_not_allowed", method: req.method });
