@@ -78,6 +78,13 @@ function dbErrorFields(
   };
 }
 
+function requireRpcUuid(value: unknown, operation: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`${operation} returned an invalid account id`);
+  }
+  return value;
+}
+
 /**
  * Reads Google's error response body and returns only the safe error fields.
  * The body can echo token material, so the raw body is never logged.
@@ -519,6 +526,7 @@ Deno.serve(async (req: Request) => {
 
     const now = new Date().toISOString();
     let accountId: string;
+    let refreshTokenStored = false;
 
     if (existingRow) {
       // Preserve all other account data — only refresh the reconnect state
@@ -554,38 +562,37 @@ Deno.serve(async (req: Request) => {
         accountId,
       });
     } else {
-      const insert = {
-        google_email: email,
-        name: displayName || email,
-        status: "active",
-      };
+      const { data: createdAccountId, error: createError } = await admin.rpc(
+        "admin_create_drive_account_with_refresh_token",
+        {
+          p_google_email: email,
+          p_name: displayName || email,
+          p_refresh_token: refreshToken,
+        },
+      );
 
-      const { data: created, error: insertError } = await admin
-        .from("drive_accounts")
-        .insert(insert)
-        .select("id")
-        .maybeSingle();
-
-      if (insertError) {
+      if (createError) {
         // Lost an insert race: reconnect to the row that won.
-        if (insertError.code === "23505") {
-          const { data: raced } = await admin
+        if (createError.code === "23505") {
+          const { data: raced, error: racedLookupError } = await admin
             .from("drive_accounts")
-            .select("id")
+            .select("id, status, refresh_token_secret_id")
             .eq("google_email", email)
             .maybeSingle();
-          if (!raced) {
+          if (racedLookupError || !raced) {
             log("error", OPERATION, {
               event: "drive_account_insert",
               result: "failure",
               userId,
               email,
               errorName: "PostgrestError",
-              errorMessage: insertError.message,
-              ...dbErrorFields(insertError),
+              errorMessage: racedLookupError?.message ?? createError.message,
+              ...dbErrorFields(racedLookupError ?? createError),
             });
             throw new Error(
-              `Failed to create Drive account: ${insertError.message}`,
+              `Failed to create Drive account: ${
+                racedLookupError?.message ?? createError.message
+              }`,
             );
           }
           accountId = (raced as { id: string }).id;
@@ -602,15 +609,19 @@ Deno.serve(async (req: Request) => {
             userId,
             email,
             errorName: "PostgrestError",
-            errorMessage: insertError.message,
-            ...dbErrorFields(insertError),
+            errorMessage: createError.message,
+            ...dbErrorFields(createError),
           });
           throw new Error(
-            `Failed to create Drive account: ${insertError.message}`,
+            `Failed to create Drive account: ${createError.message}`,
           );
         }
       } else {
-        accountId = (created as { id: string }).id;
+        accountId = requireRpcUuid(
+          createdAccountId,
+          "admin_create_drive_account_with_refresh_token",
+        );
+        refreshTokenStored = true;
         log("info", OPERATION, {
           event: "drive_account_insert",
           result: "success",
@@ -623,7 +634,7 @@ Deno.serve(async (req: Request) => {
     // ── 6. Store the refresh token through the authoritative Vault RPC ─────
     // Only the secret reference is persisted on drive_accounts; the token
     // itself is never written here and never leaves the server.
-    if (refreshToken) {
+    if (refreshToken && !refreshTokenStored) {
       // The drive account UUID is safe to log.
       log("info", OPERATION, {
         event: "admin_store_drive_refresh_token",
@@ -675,7 +686,7 @@ Deno.serve(async (req: Request) => {
       log("info", OPERATION, {
         event: "admin_store_drive_refresh_token",
         result: "skipped",
-        reason: "no_new_refresh_token",
+        reason: refreshTokenStored ? "already_stored_atomically" : "no_new_refresh_token",
         userId,
         accountId,
       });
