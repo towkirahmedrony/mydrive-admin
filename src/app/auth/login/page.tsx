@@ -21,21 +21,32 @@ function LoginForm() {
     setLoading(true);
 
     try {
-      const { error: authError } = await supabase.auth.signInWithPassword({
-        email,
-        password,
-      });
+      const { data: signInData, error: authError } =
+        await supabase.auth.signInWithPassword({
+          email,
+          password,
+        });
 
       if (authError) {
         setError(authError.message);
         return;
       }
 
-      // Check if user is admin
+      // Look up the admin role by the authenticated user id, not by email.
+      // profiles.email is nullable and may not match the login email, while
+      // profiles.id is the 1:1 FK to auth.users.id (== auth.uid()). This matches
+      // the lookup that middleware and Edge Functions already use.
+      const userId = signInData.user?.id;
+      if (!userId) {
+        setError("Access denied. Administrator privileges required.");
+        await supabase.auth.signOut();
+        return;
+      }
+
       const { data: profile, error: profileError } = await supabase
         .from("profiles")
         .select("role")
-        .eq("email", email)
+        .eq("id", userId)
         .single();
 
       if (profileError || !profile || profile.role !== "admin") {
