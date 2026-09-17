@@ -229,9 +229,32 @@ export async function getDriveAccessToken(params: {
   });
 
   if (!res.ok) {
-    // Never include the response body verbatim: it can echo token hints.
+    // Capture Google's own structured error codes for diagnostics. These are
+    // stable identifiers (`invalid_grant`, `invalid_client`, ...) plus a short
+    // human description — never token material. Anything token-shaped is
+    // redacted, and the body is never included verbatim.
+    let detail = "";
+    try {
+      const parsed = await res.json() as {
+        error?: unknown;
+        error_description?: unknown;
+      };
+      const code = typeof parsed.error === "string"
+        ? parsed.error.slice(0, 60)
+        : "";
+      const description = typeof parsed.error_description === "string"
+        ? parsed.error_description.slice(0, 160)
+        : "";
+      detail = [code, description].filter(Boolean).join(": ")
+        .replace(/ya29\.[A-Za-z0-9._-]+/g, "<access_token_redacted>")
+        .replace(/1\/\/[A-Za-z0-9._-]+/g, "<refresh_token_redacted>")
+        .replace(/4\/[A-Za-z0-9._-]+/g, "<code_redacted>");
+    } catch {
+      // Non-JSON body: the HTTP status alone still classifies the failure.
+    }
     throw new Error(
-      `Google OAuth token exchange failed: HTTP ${res.status}`,
+      `Google OAuth token exchange failed: HTTP ${res.status}` +
+        (detail ? ` (${detail})` : ""),
     );
   }
 

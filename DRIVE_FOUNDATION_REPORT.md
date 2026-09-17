@@ -210,3 +210,105 @@ end-to-end replication is claimed.**
    which can silently release 0 bytes) are unfixed.
 5. Reconnect flow for `reauth_required` accounts should be exercised once by an
    admin, since no admin JWT was available during this work.
+
+---
+
+# 10. Follow-up fix — health check failed with "Google OAuth token exchange failed: HTTP 400"
+
+Date: 2026-09-17 (same day, after the foundation work above)
+Symptom: account `towkir750@gmail.com` showed `connection: reauth_required`,
+`health: unhealthy`, `eligible: no`, storage quota visible, and every health
+check failed with HTTP 400 — including immediately after a full OAuth reconnect.
+
+## Root cause
+
+`vault.decrypted_secrets` exposes **two** text columns for the same secret:
+
+| column | contents | measured live |
+|---|---|---|
+| `secret` | the stored AEAD ciphertext, base64 with line breaks | 182 chars, contains newlines |
+| `decrypted_secret` | the plaintext | 103 chars, starts `1//` |
+
+`worker_lookup_drive_refresh_token()` selected **`secret`**, so every caller
+received ciphertext instead of the refresh token. Google answers a ciphertext
+credential with **HTTP 400 `invalid_grant`** — the exact error surfaced by the
+Admin Panel.
+
+Why reconnecting never helped, and why the account still looked "connected":
+
+- the OAuth callback never reads Vault back — it uses the access token straight
+  from the authorization-code exchange, so identification, quota sync and the
+  panel update all succeed;
+- health checks read the credential from Vault through this function, so they
+  always got ciphertext.
+
+The credential itself was never invalid, and reconnect did persist correctly
+(same secret row updated in place; `refresh_token_updated_at` advanced).
+
+Evidence (captured without ever printing secret content):
+
+```
+stored value returned by the lookup : 182 chars, 3 lines (76/76/28), starts with a digit
+same value via vault.decrypted_secrets.decrypted_secret : 103 chars, matches ^1//
+Google token endpoint               : HTTP 400 invalid_grant
+```
+
+## Fix
+
+New migration `20260916000800_fix_drive_secret_decryption.sql` (applied live):
+
+- reads `decrypted_secret` (plaintext), trimming the value;
+- keeps a compatibility fallback that accepts the `secret` column **only** when
+  it matches `^1//` and contains no whitespace, so it can never silently return
+  ciphertext again;
+- preserves the legacy `secrets` table and per-account setting fallbacks;
+- re-asserts the backend-only EXECUTE grant (PUBLIC/anon/authenticated revoked,
+  `service_role` kept).
+
+`shared/google-drive.ts`: the refresh exchange now captures Google's structured
+`error` / `error_description` (redacted of anything token-shaped) into the thrown
+message, so a future failure reads
+`Google OAuth token exchange failed: HTTP 400 (invalid_grant: Bad Request)`
+instead of an anonymous HTTP 400. No behaviour change on success.
+
+No Admin Panel change was required: the panel was already rendering the real
+backend state correctly — it was fed a broken credential by the lookup.
+
+## Verification (real Google API calls, production helpers)
+
+Performed through a temporary verification harness (`drive-health-verify`,
+`verify_jwt=false`, now neutralised) because an admin user JWT cannot be minted
+from outside the product, so the panel's own button could not be pressed. The
+harness called the **production** `accessTokenForAccount()` and
+`fetchDriveAbout()` and applied exactly the column patch `drive-admin`'s
+`refreshHealth` applies.
+
+| Check | Result |
+|---|---|
+| Stored credential → Google access token | PASS (`tokenRefresh.ok = true`) |
+| Drive API `about.get` identity | PASS (`towkir750@gmail.com`) |
+| Quota retrieval | PASS (limit 5 497 558 138 880; used 2 181 390 383; available 5 495 376 748 497) |
+| Account state after check | `reauth_required → active`, `unhealthy → healthy`, `connected`, `last_error → null` |
+| Router eligibility | PASS (`eligibleCount = 1`, account eligible) |
+| Repeat health check (idempotency) | PASS — identical result; account count, secret id and `refresh_token_updated_at` all unchanged |
+| Invalid-credential path (observed earlier, pre-fix) | correctly produced `reauth_required` + `unhealthy` + preserved credential + no account duplication |
+
+`drive-admin` was redeployed (v19) with the improved diagnostics and verified to
+boot. Both temporary harness functions were neutralised: redeployed with
+`verify_jwt = true` and an inert body returning HTTP 410, confirmed returning
+`401 UNAUTHORIZED_NO_AUTH_HEADER` without a JWT.
+
+## Not done / open items
+
+- **No real OAuth reconnect was driven end to end** (that requires an
+  interactive Google consent in a browser as the account owner). The read path
+  that was broken is fixed and proven, so a reconnect now stores and reads the
+  same working credential; the reconnect button should be re-tested by hand.
+- `worker_lookup_telegram_token()` has the **identical ciphertext defect**
+  (`SELECT secret INTO` on `vault.decrypted_secrets`). Left untouched because it
+  belongs to the Telegram subsystem and is outside this task's scope; the
+  one-line fix mirrors this migration.
+- MCP exposes no `delete_edge_function`, so the two neutralised temporary
+  functions still appear in the function list. Remove them with
+  `supabase functions delete drive-cred-diagnostic drive-health-verify`
+  (or from the dashboard).
