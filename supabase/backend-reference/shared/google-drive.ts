@@ -86,6 +86,111 @@ export interface AccessTokenResult {
 }
 
 /**
+ * Error raised by the Drive `about.get` call. Carries the HTTP status so the
+ * caller can classify the failure (401/403 => authorization, 429/5xx =>
+ * transient) without ever reading the response body, which can echo tokens.
+ */
+export class DriveAboutError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "DriveAboutError";
+    this.status = status;
+  }
+}
+
+/** Safe, secret-free fields of a successful `about.get` response. */
+export interface DriveAboutInfo {
+  email: string | null;
+  displayName: string | null;
+  /**
+   * Google byte counts are strings and may legitimately be absent:
+   *  - `limit` is omitted for accounts without a fixed quota (pooled storage)
+   *  - `usage` can be missing while Google is still computing it
+   * Both are normalized to a digits-only string, or null when unusable.
+   */
+  storageLimitBytes: string | null;
+  storageUsageBytes: string | null;
+  /** limit - usage, clamped at 0; null when either side is unavailable. */
+  storageAvailableBytes: string | null;
+}
+
+/** Digits-only byte count, or null. Never throws on hostile input. */
+function normalizeByteCount(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return /^\d+$/.test(normalized) ? normalized : null;
+}
+
+/** Subtracts two byte counts with BigInt; clamps negatives at zero. */
+function subtractByteCounts(limit: string, usage: string): string {
+  const available = BigInt(limit) - BigInt(usage);
+  return (available >= 0n ? available : 0n).toString();
+}
+
+/**
+ * Reads the account identity + storage quota from the Drive API.
+ *
+ * The refresh token is never involved here (callers pass a short-lived access
+ * token); the response body is never logged or returned verbatim.
+ */
+export async function fetchDriveAbout(
+  accessToken: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<DriveAboutInfo> {
+  if (!accessToken) {
+    throw new DriveAboutError("Missing Drive access token", 0);
+  }
+
+  const url = new URL(`${DRIVE_API}/about`);
+  url.searchParams.set(
+    "fields",
+    "user(emailAddress,displayName),storageQuota(limit,usage)",
+  );
+
+  const res = await fetchImpl(url.toString(), {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    signal: AbortSignal.timeout(20_000),
+  });
+
+  if (!res.ok) {
+    // Deliberately no body read: it can echo token material.
+    throw new DriveAboutError(
+      `Drive about.get failed: HTTP ${res.status}`,
+      res.status,
+    );
+  }
+
+  const json = await res.json() as {
+    user?: { emailAddress?: string; displayName?: string };
+    storageQuota?: { limit?: string | null; usage?: string | null } | null;
+  };
+
+  const limit = normalizeByteCount(json.storageQuota?.limit);
+  const usage = normalizeByteCount(json.storageQuota?.usage);
+
+  return {
+    email: json.user?.emailAddress?.trim() ?? null,
+    displayName: json.user?.displayName?.trim() ?? null,
+    storageLimitBytes: limit,
+    storageUsageBytes: usage,
+    storageAvailableBytes: limit !== null && usage !== null
+      ? subtractByteCounts(limit, usage)
+      : null,
+  };
+}
+
+/**
+ * Extracts `HTTP <status>` from an error message produced by this module, or 0.
+ * Used to classify Google failures without depending on error internals.
+ */
+export function httpStatusFromError(err: unknown): number {
+  const match = /HTTP (\d{3})/.exec((err as Error)?.message ?? "");
+  return match ? Number(match[1]) : 0;
+}
+
+/**
  * Exchanges a stored refresh token for a short-lived access token.
  * The refresh token is held only in memory for the duration of the call.
  */

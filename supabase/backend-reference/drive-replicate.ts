@@ -1,4 +1,3 @@
-import { serve } from "jsr:@std/http";
 import { corsHeaders, handleCors } from "../shared/cors.ts";
 import { getSupabaseAdmin } from "../shared/auth.ts";
 import {
@@ -111,7 +110,10 @@ let inflight = 0;
 
 // ─── Entry point ──────────────────────────────────────────────────────────
 
-serve(async (req: Request) => {
+// Deno.serve instead of `import { serve } from "jsr:@std/http"`: the deployed
+// edge runtime resolves that module to a version with no `serve` export, which
+// made this worker fail with a BOOT_ERROR and never run at all.
+Deno.serve(async (req: Request) => {
   const corsResponse = handleCors(req);
   if (corsResponse) return corsResponse;
 
@@ -160,7 +162,9 @@ serve(async (req: Request) => {
 
     while (processed < BATCH_SIZE && Date.now() - started < MAX_MS) {
       const claimed = await claimNextJob(admin);
-      if (!claimed) break;
+      // PostgREST returns a NULL composite (claim_drive_job found nothing) as
+      // an all-null object rather than null, so the id must be checked too.
+      if (!claimed || !claimed.id) break;
 
       const result = await processJob(admin, claimed, {
         ...typedSettings,
