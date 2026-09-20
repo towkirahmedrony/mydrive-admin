@@ -73,7 +73,6 @@ function Thumbnail({ media }: { media: MediaAsset }) {
   const video = isVideo(media);
   if (media.thumbnail_url && !video) {
     return (
-      {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         src={media.thumbnail_url}
         alt=""
@@ -467,7 +466,6 @@ function MediaDetail({
           {isVideo(media) ? (
             <div className="flex aspect-video items-center justify-center bg-slate-900 text-5xl text-white">▶</div>
           ) : media.thumbnail_url || media.storage_url ? (
-            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img src={media.thumbnail_url || media.storage_url || ""} alt="Media preview" className="max-h-80 w-full object-contain" />
           ) : (
             <div className="flex h-48 items-center justify-center text-5xl text-gray-300">▣</div>

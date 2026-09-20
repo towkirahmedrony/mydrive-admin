@@ -161,7 +161,11 @@ const DESTINATIONS = [
 ] as const;
 
 type Client = Awaited<ReturnType<typeof createClient>>;
-type Filter = (query: any) => any;
+type FilterQuery = {
+  eq(column: string, value: unknown): FilterQuery;
+  gte(column: string, value: unknown): FilterQuery;
+};
+type Filter = (query: FilterQuery) => void;
 /** supabase-js builders are PromiseLike, not real Promises. */
 type Loaded<T> = PromiseLike<{ data: T | null; error: string | null }>;
 
@@ -171,8 +175,8 @@ async function countOf(
   table: string,
   filter?: Filter,
 ): Promise<{ count: number; error: string | null }> {
-  let query = supabase.from(table).select("*", { count: "exact", head: true });
-  if (filter) query = filter(query);
+  const query = supabase.from(table).select("*", { count: "exact", head: true });
+  if (filter) filter(query);
   const { count, error } = await query;
   return { count: count ?? 0, error: error?.message ?? null };
 }

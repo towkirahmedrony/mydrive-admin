@@ -18,7 +18,7 @@ export async function middleware(request: NextRequest) {
           cookiesToSet: Array<{
             name: string;
             value: string;
-            options?: Record<string, unknown>;
+            options?: Parameters<typeof supabaseResponse.cookies.set>[2];
           }>
         ) {
           cookiesToSet.forEach(({ name, value }) =>
@@ -28,7 +28,7 @@ export async function middleware(request: NextRequest) {
             request,
           });
           cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options as any)
+            supabaseResponse.cookies.set(name, value, options)
           );
         },
       },
