@@ -1,16 +1,15 @@
-# MyDrive — Supabase Database Schema
+# MyDrive — Supabase Database Schema (Full)
 
 **Project:** MyDrive
 **Project ID:** `gpiuxcdjmrzcouhjapcs`
 **Database:** PostgreSQL 17 (Supabase, ap-southeast-1)
-**Schema:** `public`
-All tables have Row Level Security (RLS) enabled.
+All `public` schema tables have Row Level Security (RLS) enabled.
 
 ---
 
-## profiles
-User accounts (extends `auth.users`).
+## Tables
 
+### profiles
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, FK → auth.users.id |
@@ -21,12 +20,13 @@ User accounts (extends `auth.users`).
 | last_seen_at | timestamptz | nullable |
 | created_at | timestamptz | default now() |
 | updated_at | timestamptz | default now() |
+| department_id | uuid | nullable, FK → departments.id |
+| employee_id | text | nullable, unique (partial index, non-null only) |
+| designation | text | nullable |
+| storage_quota_bytes | bigint | nullable, check ≥ 0 |
+| storage_used_bytes | bigint | default 0, check ≥ 0 — auto-synced by trigger `trg_media_assets_storage_used` |
 
----
-
-## devices
-Android devices registered per user.
-
+### devices
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -40,12 +40,12 @@ Android devices registered per user.
 | last_seen_at | timestamptz | nullable |
 | created_at | timestamptz | default now() |
 | updated_at | timestamptz | default now() |
+| push_token | text | nullable — FCM/push token |
+| push_token_updated_at | timestamptz | nullable |
+| wifi_only_sync | boolean | default false |
+| auto_delete_after_backup | boolean | default false |
 
----
-
-## media_assets
-Core table for uploaded media (photos/videos).
-
+### media_assets
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -80,11 +80,7 @@ Core table for uploaded media (photos/videos).
 | primary_deleted_at | timestamptz | nullable |
 | cleanup_telegram_override | boolean | default false |
 
----
-
-## media_variants
-Derived variants (thumbnail/telegram/preview) of a media asset.
-
+### media_variants
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -102,11 +98,7 @@ Derived variants (thumbnail/telegram/preview) of a media asset.
 | storage_url | text | nullable |
 | created_at | timestamptz | default now() |
 
----
-
-## drive_accounts
-Google Drive accounts used as replication destinations.
-
+### drive_accounts
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -134,11 +126,7 @@ Google Drive accounts used as replication destinations.
 | last_error_at | timestamptz | nullable |
 | notes | text | nullable |
 
----
-
-## drive_folders
-Folder tree mirrored on each Drive account.
-
+### drive_folders
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -155,11 +143,7 @@ Folder tree mirrored on each Drive account.
 | last_error | text | nullable |
 | updated_at | timestamptz | default now() |
 
----
-
-## replication_jobs
-Jobs that copy media to Telegram and/or Google Drive.
-
+### replication_jobs
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -185,11 +169,7 @@ Jobs that copy media to Telegram and/or Google Drive.
 | google_drive_upload_chunk | bigint | default 0, check ≥ 0 |
 | google_drive_upload_attempts | integer | default 0, check ≥ 0 |
 
----
-
-## telegram_configs
-Per-user Telegram bot/chat configuration for replication.
-
+### telegram_configs
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -202,11 +182,7 @@ Per-user Telegram bot/chat configuration for replication.
 | created_at | timestamptz | default now() |
 | updated_at | timestamptz | default now() |
 
----
-
-## app_settings
-Single-row global configuration table.
-
+### app_settings (single-row global config)
 | Column | Type | Constraints |
 |---|---|---|
 | id | boolean | PK, default true |
@@ -224,11 +200,7 @@ Single-row global configuration table.
 | created_at | timestamptz | default now() |
 | updated_at | timestamptz | default now() |
 
----
-
-## sync_logs
-Event log for replication activity.
-
+### sync_logs
 | Column | Type | Constraints |
 |---|---|---|
 | id | bigint | PK, identity |
@@ -240,11 +212,7 @@ Event log for replication activity.
 | metadata | jsonb | nullable |
 | created_at | timestamptz | default now() |
 
----
-
-## notifications
-In-app user notifications.
-
+### notifications
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -256,11 +224,7 @@ In-app user notifications.
 | created_at | timestamptz | default now() |
 | read_at | timestamptz | nullable |
 
----
-
-## oauth_states
-Short-lived state tokens for Google OAuth flow.
-
+### oauth_states
 | Column | Type | Constraints |
 |---|---|---|
 | id | uuid | PK, default gen_random_uuid() |
@@ -269,11 +233,7 @@ Short-lived state tokens for Google OAuth flow.
 | created_at | timestamptz | default now() |
 | expires_at | timestamptz | default now() + 10 minutes |
 
----
-
-## admin_audit_logs
-Audit trail for admin actions.
-
+### admin_audit_logs
 | Column | Type | Constraints |
 |---|---|---|
 | id | bigint | PK, identity |
@@ -285,13 +245,115 @@ Audit trail for admin actions.
 | success | boolean | default true |
 | created_at | timestamptz | default now() |
 
+### departments
+| Column | Type | Constraints |
+|---|---|---|
+| id | uuid | PK, default gen_random_uuid() |
+| name | text | unique |
+| description | text | nullable |
+| created_at | timestamptz | default now() |
+| updated_at | timestamptz | default now() |
+| storage_quota_bytes | bigint | nullable, check ≥ 0 |
+
+### backup_sessions
+| Column | Type | Constraints |
+|---|---|---|
+| id | uuid | PK, default gen_random_uuid() |
+| device_id | uuid | FK → devices.id |
+| started_at | timestamptz | default now() |
+| completed_at | timestamptz | nullable |
+| status | text | default `'RUNNING'`, check: `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED` |
+| files_count | integer | default 0, check ≥ 0 |
+| files_uploaded | integer | default 0, check ≥ 0 |
+| files_failed | integer | default 0, check ≥ 0 |
+| total_size_bytes | bigint | default 0, check ≥ 0 |
+| error_message | text | nullable |
+| created_at | timestamptz | default now() |
+| updated_at | timestamptz | default now() |
+
+---
+
+## Views
+
+### device_storage_usage
+`security_invoker = on` (respects querying user's RLS, not the view creator's).
+
+| Column | Source |
+|---|---|
+| device_id | devices.id |
+| user_id | devices.user_id |
+| device_name | devices.device_name |
+| total_bytes | SUM(media_assets.file_size) where status='READY' and deleted_at is null |
+| file_count | COUNT(media_assets.id) where status='READY' and deleted_at is null |
+
+---
+
+## Functions
+
+### `private` schema
+| Function | Args | Returns | Security |
+|---|---|---|---|
+| `is_admin()` | — | boolean | DEFINER |
+
+### `public` schema
+| Function | Args | Returns | Security |
+|---|---|---|---|
+| `admin_allow_cleanup_despite_telegram` | p_media_id uuid, p_allow boolean, p_reason text | media_assets | DEFINER |
+| `admin_create_drive_account_with_refresh_token` | p_google_email text, p_name text, p_refresh_token text | uuid | DEFINER |
+| `admin_store_drive_refresh_token` | p_drive_account_id uuid, p_refresh_token text | uuid | DEFINER |
+| `assign_drive_replication_job` | p_job_id uuid, p_drive_account_id uuid, p_drive_folder_id uuid | void | DEFINER |
+| `claim_cloudinary_cleanup` | p_limit integer | media_assets | DEFINER |
+| `claim_drive_folder` | p_drive_account_id uuid, p_owner_id uuid, p_folder_name text, p_folder_type text, p_parent_folder_id uuid | record | DEFINER |
+| `claim_drive_job` | — | replication_jobs | DEFINER |
+| `claim_telegram_job` | — | replication_jobs | DEFINER |
+| `complete_cloudinary_cleanup` | p_media_id uuid, p_status text, p_error text | void | DEFINER |
+| `complete_drive_folder` | p_folder_row_id uuid, p_google_folder_id text | drive_folders | DEFINER |
+| `complete_drive_job` | p_job_id uuid, p_status text, p_last_error text, p_drive_account_id uuid, p_drive_folder_id uuid, p_google_drive_file_id text, p_next_retry_at timestamptz, p_upload_url text, p_upload_chunk bigint, p_upload_attempts integer | void | DEFINER |
+| `complete_telegram_job` | p_job_id uuid, p_status text, p_last_error text, p_message_id bigint, p_telegram_file_id text, p_next_retry_at timestamptz | void | DEFINER |
+| `enqueue_drive_replication_job` | p_media_id uuid | replication_jobs | DEFINER |
+| `fail_drive_folder` | p_folder_row_id uuid, p_error text | void | DEFINER |
+| `failover_drive_replication_job` | p_job_id uuid, p_failed_account_id uuid, p_error text, p_next_retry_at timestamptz | void | DEFINER |
+| `guard_profile_privileged_columns` | — (trigger) | trigger | DEFINER |
+| `handle_new_user` | — (trigger) | trigger | DEFINER |
+| `list_eligible_drive_accounts` | p_required_bytes bigint, p_exclude_account_ids uuid[], p_safety_margin_bytes bigint | drive_accounts (set) | DEFINER |
+| `mark_drive_account_result` | p_drive_account_id uuid, p_health_status text, p_status text, p_last_error text | drive_accounts | DEFINER |
+| `release_drive_quota` | p_drive_account_id uuid, p_bytes bigint | void | DEFINER |
+| `reserve_drive_account` | p_required_bytes bigint, p_exclude_account_ids uuid[], p_safety_margin_bytes bigint | drive_accounts | DEFINER |
+| `select_drive_account` | p_required_bytes bigint, p_exclude_account_ids uuid[], p_safety_margin_bytes bigint | drive_accounts | DEFINER |
+| `set_updated_at` | — (trigger) | trigger | INVOKER |
+| `sync_profile_storage_used` | — (trigger) | trigger | DEFINER — EXECUTE revoked from `anon`/`authenticated` (trigger-only, not exposed via REST) |
+| `trigger_drive_worker` | — | bigint | DEFINER |
+| `worker_lookup_drive_refresh_token` | p_secret_id uuid, p_drive_account_id uuid | text | DEFINER |
+| `worker_lookup_telegram_token` | p_secret_id uuid, p_user_id uuid | text | DEFINER |
+
+---
+
+## Edge Functions
+
+| Slug | Purpose (inferred from name) | JWT verification |
+|---|---|---|
+| `cloudinary-upload-auth` | Issues signed upload params for Cloudinary | on |
+| `finalize-media` | Finalizes a media_assets row after upload completes | on |
+| `sync-device` | Device check-in / registers device, triggers sync | on |
+| `telegram-replicate` | Worker: replicates media to Telegram | on |
+| `drive-admin` | Admin operations on Drive accounts/folders | on |
+| `process-backup` | Orchestrates a device's backup run | on |
+| `drive-replicate` | Worker: replicates media to Google Drive | on |
+| `google-oauth-initiate` | Starts Google OAuth flow for a Drive account | on |
+| `google-oauth-callback` | Handles Google OAuth redirect/token exchange | off (public callback endpoint) |
+| `drive-cred-diagnostic` | Diagnoses Drive account credential/health issues | on |
+| `drive-health-verify` | Verifies Drive account health/connectivity | on |
+| `admin-media` | Admin media management endpoint | on |
+
 ---
 
 ## Relationship overview
 
-- `profiles` (users) → owns `devices`, `media_assets`, `drive_folders`, `notifications`, `telegram_configs`
-- `devices` → source of `media_assets`
-- `media_assets` → has many `media_variants`, `replication_jobs`, `sync_logs`
-- `drive_accounts` → has many `drive_folders`; `drive_folders` is self-referencing (parent/child tree)
+- `profiles` → `departments` (many-to-one), owns `devices`, `media_assets`, `drive_folders`, `notifications`, `telegram_configs`
+- `devices` → source of `media_assets`, `backup_sessions`; has `push_token` for FCM delivery
+- `media_assets` → has many `media_variants`, `replication_jobs`, `sync_logs`; drives `profiles.storage_used_bytes` via trigger
+- `drive_accounts` → has many `drive_folders` (self-referencing parent/child tree)
 - `replication_jobs` → links a `media_asset`/`media_variant` to a destination (`telegram_configs` or `drive_accounts` + `drive_folders`)
-- `sync_logs` and `admin_audit_logs` are append-only logs referencing the above
+- `sync_logs` and `admin_audit_logs` are append-only logs
+- `backup_sessions` summarizes each device's backup run (separate from the per-file `replication_jobs`)
+- `device_storage_usage` is a reporting view, not a stored table
