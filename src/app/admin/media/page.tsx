@@ -1,50 +1,141 @@
-"use client";
-
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { createClient } from "@/lib/supabase/client";
+import Link from "next/link";
 import EmptyState from "@/components/EmptyState";
+import EmployeeAvatar from "@/components/EmployeeAvatar";
+import Pager from "@/components/Pager";
 import RefreshButton from "@/components/RefreshButton";
 import StatusBadge from "@/components/StatusBadge";
+import { formatBytes } from "@/lib/format";
+import {
+  employeeDisplayName,
+  employeeInitials,
+  loadEmployeeFolders,
+} from "@/lib/media-data";
+import EmployeeSearch from "./employee-search";
 
-const FUNCTION_NAME = "admin-media";
-const PAGE_SIZE = 24;
-type ViewMode = "grid" | "list";
-type SortKey = "newest" | "oldest" | "largest" | "smallest" | "name";
-type MediaStatus = "ALL" | "UPLOADING" | "READY" | "FAILED" | "DELETED";
-type Job = { id: string; destination_type: "telegram" | "google_drive"; status: string; last_error: string | null; completed_at: string | null };
-type Media = { id: string; owner_id: string; file_name: string | null; mime_type: string | null; file_size: number | null; width: number | null; height: number | null; duration_ms: number | null; storage_provider: string | null; storage_path: string | null; storage_url: string | null; thumbnail_url: string | null; status: string; created_at: string; uploaded_at: string | null; deleted_at: string | null; jobs: Job[] };
-type ResponseShape = { success: boolean; media: Media[]; total: number; total_bytes: number; page: number; page_size: number; error?: string };
+type SearchParams = Promise<{ q?: string; page?: string }>;
 
-function formatBytes(value: number | null | undefined): string { if (value === null || value === undefined || !Number.isFinite(value)) return "—"; if (value < 1024) return `${value} B`; const units = ["KB", "MB", "GB", "TB"]; let amount = value; let unit = -1; while (amount >= 1024 && unit < units.length - 1) { amount /= 1024; unit += 1; } return `${amount.toFixed(amount >= 10 ? 0 : 1)} ${units[unit]}`; }
-function formatDate(value: string | null | undefined): string { if (!value) return "—"; const date = new Date(value); return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString(); }
-function isVideo(media: Media): boolean { return media.mime_type?.toLowerCase().startsWith("video/") ?? false; }
-function ownerLabel(ownerId: string): string { return ownerId.length > 16 ? `${ownerId.slice(0, 8)}…${ownerId.slice(-6)}` : ownerId; }
-function jobFor(media: Media, destination: Job["destination_type"]): Job | undefined { return media.jobs.find((job) => job.destination_type === destination); }
-function jobTone(status: string | undefined): "success" | "warning" | "danger" | "neutral" { if (status === "COMPLETED") return "success"; if (status === "FAILED") return "danger"; if (status) return "warning"; return "neutral"; }
-
-function MediaCard({ media, selected, onSelect, onOpen }: { media: Media; selected: boolean; onSelect: () => void; onOpen: () => void }) {
-  const video = isVideo(media); const drive = jobFor(media, "google_drive");
-  return <article className={`group overflow-hidden rounded-xl border bg-white shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${selected ? "border-primary-500 ring-2 ring-primary-100" : "border-gray-200"}`}>
-    <div className="relative aspect-[4/3] bg-gray-100">{media.thumbnail_url ? video ? <div className="flex h-full items-center justify-center bg-slate-900 text-white"><span className="rounded-full bg-white/15 px-4 py-3 text-2xl">▶</span></div> : <img src={media.thumbnail_url} alt="" loading="lazy" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-4xl text-gray-300">{video ? "▶" : "▧"}</div>}
-      <label className="absolute left-3 top-3 rounded-md bg-white/95 p-1.5 shadow-sm" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected} onChange={onSelect} aria-label={`Select ${media.file_name || media.id}`} className="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500" /></label>{video && <span className="absolute right-3 top-3 rounded-full bg-black/65 px-2 py-1 text-xs font-semibold text-white">VIDEO</span>}<button type="button" onClick={onOpen} className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-4 pb-3 pt-8 text-left text-white opacity-0 transition group-hover:opacity-100 focus:opacity-100">Open details</button>
-    </div><div className="space-y-3 p-4"><div className="min-w-0"><h2 className="truncate text-sm font-semibold text-gray-900" title={media.file_name || media.id}>{media.file_name || "Untitled media"}</h2><p className="mt-1 truncate text-xs text-gray-500">{media.mime_type || "Unknown type"} · {formatBytes(media.file_size)}</p></div><div className="flex flex-wrap gap-1.5"><StatusBadge label={media.status} tone={media.status === "READY" ? "success" : media.status === "FAILED" ? "danger" : "warning"} /><StatusBadge label={`Drive: ${drive?.status || "—"}`} tone={jobTone(drive?.status)} /></div><div className="flex items-center justify-between text-xs text-gray-500"><span>{ownerLabel(media.owner_id)}</span><span>{formatDate(media.uploaded_at || media.created_at)}</span></div></div>
-  </article>;
+function hrefFor(search: string, page: number): string {
+  const params = new URLSearchParams();
+  if (search) params.set("q", search);
+  if (page > 1) params.set("page", String(page));
+  const query = params.toString();
+  return query ? `/admin/media?${query}` : "/admin/media";
 }
 
-export default function MediaPage() {
-  const [media, setMedia] = useState<Media[]>([]); const [total, setTotal] = useState(0); const [totalBytes, setTotalBytes] = useState(0); const [page, setPage] = useState(1); const [query, setQuery] = useState(""); const [inputQuery, setInputQuery] = useState(""); const [status, setStatus] = useState<MediaStatus>("ALL"); const [kind, setKind] = useState<"ALL" | "IMAGE" | "VIDEO">("ALL"); const [userId, setUserId] = useState(""); const [sort, setSort] = useState<SortKey>("newest"); const [view, setView] = useState<ViewMode>("grid"); const [selected, setSelected] = useState<Set<string>>(new Set()); const [detail, setDetail] = useState<Media | null>(null); const [loading, setLoading] = useState(true); const [error, setError] = useState<string | null>(null); const [notice, setNotice] = useState<string | null>(null); const [retrying, setRetrying] = useState(false);
-  const load = useCallback(async () => { setLoading(true); setError(null); try { const supabase = createClient(); const { data, error: invokeError } = await supabase.functions.invoke<ResponseShape>(FUNCTION_NAME, { body: { action: "list", page, page_size: PAGE_SIZE, search: query || undefined, status: status === "ALL" ? undefined : status, kind: kind === "ALL" ? undefined : kind, user_id: userId || undefined, sort } }); if (invokeError || !data?.success) throw new Error(data?.error || invokeError?.message || "Unable to load media."); setMedia(data.media || []); setTotal(data.total || 0); setTotalBytes(data.total_bytes || 0); } catch (err) { setError(err instanceof Error ? err.message : "Unable to load media. Please try again."); } finally { setLoading(false); } }, [kind, page, query, sort, status, userId]);
-  useEffect(() => { const timer = window.setTimeout(() => { setPage(1); setQuery(inputQuery.trim()); }, 350); return () => window.clearTimeout(timer); }, [inputQuery]); useEffect(() => { void load(); }, [load]);
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE)); const allSelected = media.length > 0 && media.every((item) => selected.has(item.id)); const selectedMedia = useMemo(() => media.filter((item) => selected.has(item.id)), [media, selected]);
-  const toggleAll = () => { const next = new Set(selected); if (allSelected) media.forEach((item) => next.delete(item.id)); else media.forEach((item) => next.add(item.id)); setSelected(next); }; const toggle = (id: string) => { const next = new Set(selected); if (next.has(id)) next.delete(id); else next.add(id); setSelected(next); };
-  const retrySelected = async () => { if (!selectedMedia.length || retrying) return; setRetrying(true); setNotice(null); setError(null); try { const supabase = createClient(); const { data, error: invokeError } = await supabase.functions.invoke<{ success: boolean; retried: number; error?: string }>(FUNCTION_NAME, { body: { action: "retry", media_ids: selectedMedia.map((item) => item.id) } }); if (invokeError || !data?.success) throw new Error(data?.error || invokeError?.message || "Retry was not available."); setNotice(`${data.retried} replication job${data.retried === 1 ? "" : "s"} queued for retry.`); setSelected(new Set()); await load(); } catch (err) { setError(err instanceof Error ? err.message : "Retry failed."); } finally { setRetrying(false); } };
+export default async function MediaEmployeesPage({
+  searchParams,
+}: {
+  searchParams: SearchParams;
+}) {
+  const params = await searchParams;
+  const search = params.q?.trim() ?? "";
+  const page = Math.max(1, Number(params.page) || 1);
+  const { employees, total, pageSize, error } = await loadEmployeeFolders({
+    search,
+    page,
+  });
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
 
-  return <div className="space-y-6"><header className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start"><div><p className="text-sm font-medium text-primary-600">Operations / Observability</p><h1 className="mt-1 text-3xl font-bold tracking-tight text-gray-900">Media</h1><p className="mt-2 text-sm text-gray-500">Browse uploaded media and inspect its archive lifecycle without exposing user-facing controls.</p></div><RefreshButton label="Refresh" /></header>
-    <section className="grid gap-4 sm:grid-cols-3"><div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm"><p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Total media</p><p className="mt-2 text-2xl font-bold text-gray-900">{total.toLocaleString()}</p></div><div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm"><p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Page storage</p><p className="mt-2 text-2xl font-bold text-gray-900">{formatBytes(totalBytes)}</p><p className="mt-1 text-xs text-gray-500">Aggregate for the current result set</p></div><div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm"><p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Selected</p><p className="mt-2 text-2xl font-bold text-gray-900">{selected.size}</p><p className="mt-1 text-xs text-gray-500">Safe retry applies to eligible failed jobs</p></div></section>
-    <section className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm"><div className="flex flex-col gap-3 lg:flex-row lg:items-center"><label className="relative flex-1"><span className="sr-only">Search media</span><input value={inputQuery} onChange={(event) => setInputQuery(event.target.value)} placeholder="Search file name, path, or media ID…" className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm outline-none ring-primary-500 placeholder:text-gray-400 focus:ring-2" /></label><input value={userId} onChange={(event) => { setUserId(event.target.value); setPage(1); }} placeholder="Owner UUID" className="rounded-lg border border-gray-300 px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-primary-500 lg:w-52" /><select value={kind} onChange={(event) => { setKind(event.target.value as typeof kind); setPage(1); }} className="rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm"><option value="ALL">All types</option><option value="IMAGE">Images</option><option value="VIDEO">Videos</option></select><select value={status} onChange={(event) => { setStatus(event.target.value as MediaStatus); setPage(1); }} className="rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm"><option value="ALL">All media states</option><option value="READY">Ready</option><option value="UPLOADING">Uploading</option><option value="FAILED">Failed</option><option value="DELETED">Deleted</option></select><select value={sort} onChange={(event) => { setSort(event.target.value as SortKey); setPage(1); }} className="rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm"><option value="newest">Newest</option><option value="oldest">Oldest</option><option value="largest">Largest</option><option value="smallest">Smallest</option><option value="name">File name</option></select><div className="flex rounded-lg border border-gray-300 p-1"><button type="button" onClick={() => setView("grid")} aria-pressed={view === "grid"} className={`rounded px-2.5 py-1 text-sm ${view === "grid" ? "bg-gray-900 text-white" : "text-gray-600"}`}>Grid</button><button type="button" onClick={() => setView("list")} aria-pressed={view === "list"} className={`rounded px-2.5 py-1 text-sm ${view === "list" ? "bg-gray-900 text-white" : "text-gray-600"}`}>List</button></div></div><div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-gray-100 pt-3"><label className="flex items-center gap-2 text-sm text-gray-600"><input type="checkbox" checked={allSelected} onChange={toggleAll} className="h-4 w-4 rounded border-gray-300 text-primary-600" /> Select visible</label><div className="flex items-center gap-3">{selected.size > 0 && <button type="button" onClick={retrySelected} disabled={retrying} className="rounded-lg bg-primary-600 px-3 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:cursor-not-allowed disabled:opacity-50">{retrying ? "Queueing…" : `Retry failed (${selected.size})`}</button>}<span className="text-sm text-gray-500">{total.toLocaleString()} result{total === 1 ? "" : "s"}</span></div></div></section>
-    {notice && <div role="status" className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-800">{notice}</div>}{error && <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">{error}</div>}
-    {loading ? <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{Array.from({ length: 8 }).map((_, index) => <div key={index} className="animate-pulse overflow-hidden rounded-xl border border-gray-200 bg-white"><div className="aspect-[4/3] bg-gray-200" /><div className="space-y-3 p-4"><div className="h-4 w-3/4 rounded bg-gray-200" /><div className="h-3 w-1/2 rounded bg-gray-200" /><div className="h-5 w-2/3 rounded bg-gray-200" /></div></div>)}</div> : media.length === 0 ? <EmptyState icon="▧" title="No media found" detail={query || userId || status !== "ALL" || kind !== "ALL" ? "Try clearing a filter or changing the search." : "Media uploaded by users will appear here."} /> : view === "grid" ? <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">{media.map((item) => <MediaCard key={item.id} media={item} selected={selected.has(item.id)} onSelect={() => toggle(item.id)} onOpen={() => setDetail(item)} />)}</div> : <div className="overflow-hidden rounded-xl border border-gray-200 bg-white shadow-sm"><div className="overflow-x-auto"><table className="min-w-full divide-y divide-gray-200 text-left text-sm"><thead className="bg-gray-50 text-xs uppercase tracking-wide text-gray-500"><tr><th className="px-4 py-3">Select</th><th className="px-4 py-3">File</th><th className="px-4 py-3">Owner</th><th className="px-4 py-3">State</th><th className="px-4 py-3">Drive</th><th className="px-4 py-3">Size</th><th className="px-4 py-3">Uploaded</th></tr></thead><tbody className="divide-y divide-gray-100">{media.map((item) => { const drive = jobFor(item, "google_drive"); return <tr key={item.id} className="cursor-pointer hover:bg-gray-50" onClick={() => setDetail(item)}><td className="px-4 py-3" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selected.has(item.id)} onChange={() => toggle(item.id)} className="h-4 w-4 rounded border-gray-300 text-primary-600" /></td><td className="max-w-xs px-4 py-3"><p className="truncate font-medium text-gray-900">{item.file_name || item.id}</p><p className="truncate text-xs text-gray-500">{item.mime_type || "Unknown"}</p></td><td className="px-4 py-3 font-mono text-xs text-gray-600">{ownerLabel(item.owner_id)}</td><td className="px-4 py-3"><StatusBadge label={item.status} tone={item.status === "READY" ? "success" : item.status === "FAILED" ? "danger" : "warning"} /></td><td className="px-4 py-3"><StatusBadge label={drive?.status || "—"} tone={jobTone(drive?.status)} /></td><td className="px-4 py-3 text-gray-600">{formatBytes(item.file_size)}</td><td className="whitespace-nowrap px-4 py-3 text-gray-600">{formatDate(item.uploaded_at || item.created_at)}</td></tr>; })}</tbody></table></div></div>}
-    <footer className="flex items-center justify-between"><p className="text-sm text-gray-500">Page {page} of {pageCount}</p><div className="flex gap-2"><button type="button" disabled={page <= 1 || loading} onClick={() => setPage((value) => value - 1)} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm disabled:opacity-40">Previous</button><button type="button" disabled={page >= pageCount || loading} onClick={() => setPage((value) => value + 1)} className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm disabled:opacity-40">Next</button></div></footer>
-    {detail && <div className="fixed inset-0 z-50 flex justify-end bg-black/40" role="dialog" aria-modal="true" aria-label="Media details" onClick={() => setDetail(null)}><aside className="h-full w-full max-w-xl overflow-y-auto bg-white p-6 shadow-2xl" onClick={(event) => event.stopPropagation()}><div className="flex items-start justify-between"><div><p className="text-sm font-medium text-primary-600">Media details</p><h2 className="mt-1 max-w-sm truncate text-xl font-bold text-gray-900">{detail.file_name || detail.id}</h2></div><button type="button" onClick={() => setDetail(null)} className="rounded-lg p-2 text-2xl text-gray-400 hover:bg-gray-100 hover:text-gray-700" aria-label="Close details">×</button></div><div className="mt-6 overflow-hidden rounded-xl bg-gray-100">{isVideo(detail) ? <div className="flex aspect-video items-center justify-center bg-slate-900 text-5xl text-white">▶</div> : detail.thumbnail_url || detail.storage_url ? <img src={detail.thumbnail_url || detail.storage_url || ""} alt="Media preview" className="max-h-80 w-full object-contain" /> : <div className="flex h-48 items-center justify-center text-5xl text-gray-300">▧</div>}</div><dl className="mt-6 divide-y divide-gray-100">{[["Media ID", detail.id], ["Owner", detail.owner_id], ["Type", detail.mime_type || "—"], ["Size", formatBytes(detail.file_size)], ["Dimensions", detail.width && detail.height ? `${detail.width} × ${detail.height}` : "—"], ["Duration", detail.duration_ms ? `${Math.round(detail.duration_ms / 1000)}s` : "—"], ["Storage provider", detail.storage_provider || "—"], ["Storage path", detail.storage_path || "—"], ["State", detail.status], ["Created", formatDate(detail.created_at)], ["Uploaded", formatDate(detail.uploaded_at)], ["Deleted", formatDate(detail.deleted_at)]].map(([label, value]) => <div key={label} className="grid grid-cols-[9rem_1fr] gap-4 py-3 text-sm"><dt className="text-gray-500">{label}</dt><dd className="break-words font-medium text-gray-900">{value}</dd></div>)}</dl><div className="mt-6"><h3 className="text-sm font-semibold text-gray-900">Replication status</h3><div className="mt-2 space-y-2">{detail.jobs.length ? detail.jobs.map((job) => <div key={job.id} className="rounded-lg border border-gray-200 p-3"><div className="flex items-center justify-between"><span className="font-medium capitalize text-gray-800">{job.destination_type.replace("_", " ")}</span><StatusBadge label={job.status} tone={jobTone(job.status)} /></div>{job.last_error && <p className="mt-2 text-xs text-red-700">{job.last_error}</p>}{job.completed_at && <p className="mt-2 text-xs text-gray-500">Completed {formatDate(job.completed_at)}</p>}</div>) : <p className="text-sm text-gray-500">No replication jobs recorded.</p>}</div></div></aside></div>}
-  </div>;
+  return (
+    <div className="space-y-6">
+      <header className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
+        <div>
+          <p className="text-sm font-medium text-primary-600">Office Media Manager</p>
+          <h1 className="mt-1 text-3xl font-bold tracking-tight text-gray-900">Media</h1>
+          <p className="mt-2 text-sm text-gray-500">
+            Open an employee folder to browse that employee&apos;s media.
+          </p>
+          <nav className="mt-3 text-sm text-gray-500" aria-label="Breadcrumb">
+            <ol className="flex items-center gap-2">
+              <li>
+                <Link href="/admin" className="hover:text-gray-700">
+                  Dashboard
+                </Link>
+              </li>
+              <li aria-hidden>/</li>
+              <li className="font-medium text-gray-900">Employees</li>
+            </ol>
+          </nav>
+        </div>
+        <RefreshButton label="Refresh" />
+      </header>
+
+      <section className="grid gap-4 sm:grid-cols-3">
+        <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Employees</p>
+          <p className="mt-2 text-2xl font-bold text-gray-900">{total.toLocaleString()}</p>
+        </div>
+        <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">This page</p>
+          <p className="mt-2 text-2xl font-bold text-gray-900">{employees.length}</p>
+          <p className="mt-1 text-xs text-gray-500">Employee folders</p>
+        </div>
+        <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+          <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Search</p>
+          <p className="mt-2 text-2xl font-bold text-gray-900">{search ? "Filtered" : "All"}</p>
+          <p className="mt-1 text-xs text-gray-500">Name, email, employee ID, designation</p>
+        </div>
+      </section>
+
+      <EmployeeSearch defaultValue={search} />
+
+      {error && (
+        <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          {error}
+        </div>
+      )}
+
+      {employees.length === 0 ? (
+        <EmptyState
+          icon="[]"
+          title={search ? "No employees match this search" : "No employees yet"}
+          detail={
+            search
+              ? "Try a different name, email, employee ID, or designation."
+              : "Employee folders appear here once profiles exist."
+          }
+        />
+      ) : (
+        <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+          {employees.map((employee) => {
+            const name = employeeDisplayName(employee);
+            const used = formatBytes(employee.storage_used_bytes);
+            return (
+              <Link
+                key={employee.id}
+                href={`/admin/media/${employee.id}`}
+                className="group block overflow-hidden rounded-xl border border-gray-200 bg-white p-5 shadow-sm transition hover:-translate-y-0.5 hover:border-primary-300 hover:shadow-md"
+              >
+                <div className="flex items-start gap-4">
+                  <EmployeeAvatar initials={employeeInitials(employee.full_name, employee.email)} />
+                  <div className="min-w-0 flex-1">
+                    <h2 className="truncate text-base font-semibold text-gray-900" title={name}>
+                      {name}
+                    </h2>
+                    <p className="mt-1 truncate text-sm text-gray-500">
+                      Employee ID: {employee.employee_id || "Not assigned"}
+                    </p>
+                    <p className="truncate text-sm text-gray-500">
+                      {employee.designation || "No designation"}
+                    </p>
+                  </div>
+                  {employee.status !== "active" && (
+                    <StatusBadge label={employee.status} tone="warning" />
+                  )}
+                </div>
+                <div className="mt-5 border-t border-gray-100 pt-4">
+                  <p className="text-sm font-medium text-gray-900">
+                    {employee.media_count.toLocaleString()} media
+                  </p>
+                  <p className="mt-1 text-sm text-gray-500">{used ?? "0 B"}</p>
+                </div>
+              </Link>
+            );
+          })}
+        </div>
+      )}
+
+      {total > pageSize && <Pager page={page} pageCount={pageCount} hrefFor={(next) => hrefFor(search, next)} />}
+    </div>
+  );
 }
