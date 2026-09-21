@@ -52,7 +52,7 @@ function Thumbnail({
     [media, userId, access],
   );
 
-  if (kind === "image" && !failed) {
+  if ((kind === "image" || kind === "video") && !failed) {
     return (
       <img
         src={src}

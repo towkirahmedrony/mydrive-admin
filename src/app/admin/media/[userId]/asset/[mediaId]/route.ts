@@ -1,5 +1,9 @@
 import { type NextRequest } from "next/server";
-import { isAllowedMediaUpstream, verifyMediaAccess } from "@/lib/media-access";
+import {
+  deriveCloudinaryThumbnailUrl,
+  isAllowedMediaUpstream,
+  verifyMediaAccess,
+} from "@/lib/media-access";
 import { loadMediaForAsset, requireAdminActor } from "@/lib/media-data";
 import { isUuid, type MediaVariant } from "@/lib/media-types";
 import { createClient } from "@/lib/supabase/server";
@@ -95,14 +99,14 @@ export async function GET(
 
   const upstream =
     variant === "thumb"
-      ? // Thumbnails are derived previews. Never fall back to the full-size
-        // original here: a grid of originals is exactly the traffic this
-        // variant exists to avoid.
-        media.thumbnail_url
-      : media.storage_url || media.thumbnail_url;
+      ? // Prefer a persisted preview, then derive one from the original using
+        // the existing Cloudinary delivery pipeline. Never fall back to the
+        // full-size original for a grid request.
+        media.thumbnail_url || deriveCloudinaryThumbnailUrl(media.storage_url)
+      : media.storage_url;
 
   if (!isAllowedMediaUpstream(upstream)) {
-    return plain(404, "No playable source is available for this media.");
+    return plain(422, "Media metadata does not contain a valid playable source.");
   }
 
   const range = request.headers.get("range");

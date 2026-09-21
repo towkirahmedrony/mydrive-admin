@@ -374,6 +374,14 @@ export default function MediaViewer({
           retryable: false,
         };
       }
+      if (response.status === 422) {
+        return {
+          title: "Invalid media metadata",
+          detail:
+            "This record does not contain a valid provider source. Review its storage metadata before retrying.",
+          retryable: false,
+        };
+      }
       if (response.status >= 500) {
         return {
           title: "Storage unavailable",

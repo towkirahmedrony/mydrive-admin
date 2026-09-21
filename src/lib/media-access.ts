@@ -135,3 +135,49 @@ export function isAllowedMediaUpstream(raw: string | null | undefined): boolean 
 
   return !isBlockedHost(host);
 }
+
+/**
+ * Derive a lightweight Cloudinary delivery URL from the persisted original.
+ * Upload finalisation currently stores the original secure_url but not a
+ * separate thumbnail_url, so the admin grid must use Cloudinary's delivery
+ * transformations rather than requesting the full asset.
+ */
+export function deriveCloudinaryThumbnailUrl(
+  raw: string | null | undefined,
+): string | null {
+  if (!raw) return null;
+
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+
+  if (parsed.hostname.toLowerCase() !== "res.cloudinary.com") return null;
+
+  const marker = "/upload/";
+  const uploadIndex = parsed.pathname.indexOf(marker);
+  if (uploadIndex < 0) return null;
+
+  const prefix = parsed.pathname.slice(0, uploadIndex + marker.length);
+  const deliveryPath = parsed.pathname.slice(uploadIndex + marker.length);
+  const segments = deliveryPath.split("/").filter(Boolean);
+  if (segments.length === 0) return null;
+
+  const resourceType = parsed.pathname.slice(1, uploadIndex).split("/")[0];
+  const isVideo = resourceType === "video";
+  const last = segments.length - 1;
+  if (isVideo) {
+    // Cloudinary generates a poster frame from the video when the delivery
+    // format is changed to JPG. `so_0` makes the selected frame deterministic.
+    segments[last] = segments[last].replace(/\.[^/.]+$/, "") + ".jpg";
+  }
+
+  const transformation = isVideo
+    ? "so_0,c_fill,w_480,h_360,q_auto,f_jpg"
+    : "c_fill,w_480,h_360,q_auto,f_auto";
+  parsed.pathname = `${prefix}${transformation}/${segments.join("/")}`;
+  parsed.search = "";
+  return parsed.toString();
+}
