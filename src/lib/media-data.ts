@@ -76,12 +76,6 @@ const MEDIA_COLUMNS = [
   "replication_jobs(id,destination_type,status,last_error,attempt_count,started_at,completed_at,created_at)",
 ].join(",");
 
-function asNumber(value: number | string | null | undefined): number {
-  if (value === null || value === undefined || value === "") return 0;
-  const n = typeof value === "string" ? Number(value) : value;
-  return Number.isFinite(n) ? n : 0;
-}
-
 type Client = Awaited<ReturnType<typeof createClient>>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Filter = (query: any) => any;
@@ -102,40 +96,6 @@ async function countOwnedMedia(
   return count ?? 0;
 }
 
-async function loadUsageByOwner(
-  supabase: Client,
-  ownerIds: string[],
-): Promise<Map<string, number>> {
-  const map = new Map<string, number>();
-  if (ownerIds.length === 0) return map;
-
-  const { data, error } = await supabase
-    .from("device_storage_usage")
-    .select("user_id,file_count")
-    .in("user_id", ownerIds);
-
-  if (!error && data) {
-    for (const row of data as { user_id: string; file_count: number | string | null }[]) {
-      map.set(row.user_id, (map.get(row.user_id) ?? 0) + asNumber(row.file_count));
-    }
-    return map;
-  }
-
-  const counts = await Promise.all(
-    ownerIds.map(async (id) => {
-      const { count } = await supabase
-        .from("media_assets")
-        .select("id", { count: "exact", head: true })
-        .eq("owner_id", id)
-        .is("deleted_at", null)
-        .neq("status", "DELETED");
-      return { id, count: count ?? 0 };
-    }),
-  );
-  for (const row of counts) map.set(row.id, row.count);
-  return map;
-}
-
 export async function loadEmployeeFolders(input: {
   search?: string;
   page?: number;
@@ -148,25 +108,22 @@ export async function loadEmployeeFolders(input: {
 }> {
   const supabase = await createClient();
   const page = Math.max(1, input.page ?? 1);
-  const from = (page - 1) * EMPLOYEE_PAGE_SIZE;
-  const to = from + EMPLOYEE_PAGE_SIZE - 1;
   const search = input.search ? sanitizeSearch(input.search) : "";
 
   let query = supabase
     .from("profiles")
-    .select(PROFILE_COLUMNS, { count: "exact" })
+    .select(PROFILE_COLUMNS)
     .order("full_name", { ascending: true, nullsFirst: false })
-    .order("created_at", { ascending: true })
-    .range(from, to);
+    .order("created_at", { ascending: true });
 
   if (search) {
     const term = `%${search}%`;
     query = query.or(
-      `full_name.ilike.${term},email.ilike.${term},employee_id.ilike.${term},designation.ilike.${term}`,
+      `full_name.ilike.${term},email.ilike.${term},designation.ilike.${term}`,
     );
   }
 
-  const { data, count, error } = await query;
+  const { data, error } = await query;
   if (error) {
     return {
       employees: [],
@@ -178,17 +135,34 @@ export async function loadEmployeeFolders(input: {
   }
 
   const profiles = (data ?? []) as EmployeeRow[];
-  const usage = await loadUsageByOwner(
-    supabase,
-    profiles.map((profile) => profile.id),
+  const counts = await Promise.all(
+    profiles.map(async (profile) => ({
+      profile,
+      media_count: await countOwnedMedia(supabase, profile.id),
+    })),
   );
 
+  // A user can have duplicate profile rows (for example after an account
+  // recreation). Group by the stable display identity and keep the profile
+  // that owns the most media, so one person is shown only once and the link
+  // still opens the profile containing that person's media.
+  const grouped = new Map<string, EmployeeFolder>();
+  for (const { profile, media_count } of counts) {
+    const identity = (profile.full_name?.trim() || profile.email?.trim() || profile.id).toLowerCase();
+    const candidate = { ...profile, media_count };
+    const existing = grouped.get(identity);
+    if (!existing || candidate.media_count > existing.media_count) {
+      grouped.set(identity, candidate);
+    }
+  }
+
+  const employees = Array.from(grouped.values());
+  const from = (page - 1) * EMPLOYEE_PAGE_SIZE;
+  const pageEmployees = employees.slice(from, from + EMPLOYEE_PAGE_SIZE);
+
   return {
-    employees: profiles.map((profile) => ({
-      ...profile,
-      media_count: usage.get(profile.id) ?? 0,
-    })),
-    total: count ?? 0,
+    employees: pageEmployees,
+    total: employees.length,
     page,
     pageSize: EMPLOYEE_PAGE_SIZE,
     error: null,

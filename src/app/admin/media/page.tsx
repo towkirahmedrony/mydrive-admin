@@ -73,7 +73,7 @@ export default async function MediaEmployeesPage({
         <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
           <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Search</p>
           <p className="mt-2 text-2xl font-bold text-gray-900">{search ? "Filtered" : "All"}</p>
-          <p className="mt-1 text-xs text-gray-500">Name, email, employee ID, designation</p>
+          <p className="mt-1 text-xs text-gray-500">Name, email, or designation</p>
         </div>
       </section>
 
@@ -112,9 +112,6 @@ export default async function MediaEmployeesPage({
                     <h2 className="truncate text-base font-semibold text-gray-900" title={name}>
                       {name}
                     </h2>
-                    <p className="mt-1 truncate text-sm text-gray-500">
-                      Employee ID: {employee.employee_id || "Not assigned"}
-                    </p>
                     <p className="truncate text-sm text-gray-500">
                       {employee.designation || "No designation"}
                     </p>

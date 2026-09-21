@@ -160,9 +160,6 @@ export default async function EmployeeMediaPage({
             />
             <div>
               <h2 className="text-xl font-semibold text-gray-900">{name}</h2>
-              <p className="mt-1 text-sm text-gray-500">
-                Employee ID: {employee.employee_id || "Not assigned"}
-              </p>
               <p className="text-sm text-gray-500">
                 Designation: {employee.designation || "Not assigned"}
               </p>
