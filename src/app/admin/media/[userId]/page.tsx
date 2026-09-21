@@ -6,6 +6,7 @@ import Pager from "@/components/Pager";
 import RefreshButton from "@/components/RefreshButton";
 import StatusBadge from "@/components/StatusBadge";
 import { formatBytes, usagePercent } from "@/lib/format";
+import { issueMediaAccess } from "@/lib/media-access";
 import {
   employeeDisplayName,
   employeeInitials,
@@ -114,6 +115,11 @@ export default async function EmployeeMediaPage({
   for (const [key, value] of Object.entries(query)) {
     if (value) current.set(key, value);
   }
+
+  // One short-lived grant for this render, scoped to this employee's media set.
+  // The browser only ever sees the derived admin URLs; `storage_url` and
+  // `thumbnail_url` stay in the row on the server.
+  const access = issueMediaAccess(userId);
 
   return (
     <div className="space-y-4 sm:space-y-6">
@@ -238,6 +244,7 @@ export default async function EmployeeMediaPage({
           designation={employee.designation}
           media={media}
           sessionsByDevice={sessionsByDevice}
+          access={access}
         />
       </Suspense>
 

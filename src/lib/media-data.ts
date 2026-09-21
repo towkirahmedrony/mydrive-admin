@@ -47,6 +47,13 @@ export type {
 const PROFILE_COLUMNS =
   "id,full_name,email,employee_id,designation,status,storage_quota_bytes,storage_used_bytes,last_seen_at";
 
+/**
+ * Columns sent to the browser.
+ *
+ * `storage_url` and `thumbnail_url` are deliberately absent: they are permanent
+ * provider URLs, and the admin panel reaches the bytes through the signed asset
+ * route instead (`loadMediaForAsset` reads them server-side only).
+ */
 const MEDIA_COLUMNS = [
   "id",
   "owner_id",
@@ -58,9 +65,6 @@ const MEDIA_COLUMNS = [
   "height",
   "duration_ms",
   "storage_provider",
-  "storage_path",
-  "storage_url",
-  "thumbnail_url",
   "status",
   "created_at",
   "uploaded_at",
@@ -79,6 +83,35 @@ const MEDIA_COLUMNS = [
 type Client = Awaited<ReturnType<typeof createClient>>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
 type Filter = (query: any) => any;
+
+export type AdminActorResult =
+  | { ok: true; id: string }
+  | { ok: false; error: string };
+
+/**
+ * Server-side admin gate shared by the media server action and the signed asset
+ * route. Always called with the request-scoped Supabase client so the check
+ * runs against the caller's own session.
+ */
+export async function requireAdminActor(
+  supabase: Client,
+): Promise<AdminActorResult> {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { ok: false, error: "Not authenticated." };
+
+  const { data: actor } = await supabase
+    .from("profiles")
+    .select("id,role")
+    .eq("id", user.id)
+    .maybeSingle();
+  if (!actor || actor.role !== "admin") {
+    return { ok: false, error: "Not authorized." };
+  }
+
+  return { ok: true, id: user.id };
+}
 
 async function countOwnedMedia(
   supabase: Client,
@@ -342,3 +375,40 @@ export async function ownedMediaIds(
   if (error || !data) return [];
   return data.map((row) => row.id as string);
 }
+
+/** The only fields the signed asset route needs, including the provider URLs. */
+export type MediaAssetSource = {
+  id: string;
+  owner_id: string;
+  file_name: string | null;
+  mime_type: string | null;
+  storage_url: string | null;
+  thumbnail_url: string | null;
+};
+
+/**
+ * Server-only lookup for the streaming proxy. Ownership is part of the query,
+ * so an asset belonging to another employee can never be resolved even with a
+ * valid grant — this is what keeps the viewer inside one employee's media set.
+ *
+ * The returned row is never serialised to the browser: it carries the permanent
+ * storage URL, which must stay server-side.
+ */
+export async function loadMediaForAsset(
+  userId: string,
+  mediaId: string,
+): Promise<{ media: MediaAssetSource | null; error: string | null }> {
+  if (!isUuid(userId) || !isUuid(mediaId)) return { media: null, error: null };
+
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("media_assets")
+    .select("id,owner_id,file_name,mime_type,storage_url,thumbnail_url")
+    .eq("id", mediaId)
+    .eq("owner_id", userId)
+    .maybeSingle();
+
+  if (error) return { media: null, error: error.message };
+  return { media: (data as MediaAssetSource | null) ?? null, error: null };
+}
+

@@ -1,6 +1,31 @@
 export const EMPLOYEE_PAGE_SIZE = 24;
 export const MEDIA_PAGE_SIZE = 24;
 
+/**
+ * Lifetime of a signed media access link.
+ *
+ * Long enough to cover an uninterrupted browsing session in the admin panel,
+ * short enough that a link that leaks (browser history, referrer, screenshot,
+ * shared devtools URL) stops working quickly. A fresh grant is minted on every
+ * server render and on demand from the viewer.
+ */
+export const MEDIA_ACCESS_TTL_SECONDS = 60 * 60;
+
+/** Which upstream URL an asset request should resolve to. */
+export type MediaVariant = "thumb" | "original";
+
+/**
+ * A short-lived grant that authorises reading one employee's media set.
+ *
+ * `token` is an HMAC over the employee id and the expiry instant; it is minted
+ * and verified on the server only (`@/lib/media-access`). Only the derived URL
+ * is ever handed to the browser — never a provider URL, and never a key.
+ */
+export type MediaAccessGrant = {
+  token: string;
+  expiresAt: number;
+};
+
 export type EmployeeRow = {
   id: string;
   full_name: string | null;
@@ -53,6 +78,14 @@ export type BackupSessionInfo = {
   files_count: number | null;
 };
 
+/**
+ * A media asset as the browser receives it.
+ *
+ * The storage locators (`storage_path`, `storage_url`, `thumbnail_url`) are
+ * intentionally not part of this shape: the server does not select them for the
+ * client, and the browser reaches the bytes through `mediaAssetPath(...)`.
+ * `loadMediaForAsset` (server-only) reads them when proxying.
+ */
 export type MediaAsset = {
   id: string;
   owner_id: string;
@@ -64,9 +97,6 @@ export type MediaAsset = {
   height: number | null;
   duration_ms: number | string | null;
   storage_provider: string | null;
-  storage_path: string | null;
-  storage_url: string | null;
-  thumbnail_url: string | null;
   status: string;
   created_at: string;
   uploaded_at: string | null;
@@ -139,6 +169,44 @@ export function employeeDisplayName(
     employee.employee_id?.trim() ||
     "Unnamed employee"
   );
+}
+
+/**
+ * Builds the only media URL the browser is ever allowed to see.
+ *
+ * The permanent provider URL (`media_assets.storage_url` / `thumbnail_url`)
+ * stays on the server; the client composes this authenticated, expiring admin
+ * route instead. `@/lib/media-access` mints the matching grant.
+ */
+export function mediaAssetPath(
+  userId: string,
+  mediaId: string,
+  grant: MediaAccessGrant,
+  variant: MediaVariant = "original",
+): string {
+  const params = new URLSearchParams({
+    e: String(grant.expiresAt),
+    t: grant.token,
+  });
+  if (variant === "thumb") params.set("variant", "thumb");
+  return `/admin/media/${userId}/asset/${mediaId}?${params.toString()}`;
+}
+
+export type MediaKindName = "image" | "video" | "other";
+
+export function mediaKind(media: Pick<MediaAsset, "mime_type">): MediaKindName {
+  const mime = media.mime_type?.toLowerCase() ?? "";
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("video/")) return "video";
+  return "other";
+}
+
+export function isVideoMedia(media: Pick<MediaAsset, "mime_type">): boolean {
+  return mediaKind(media) === "video";
+}
+
+export function isImageMedia(media: Pick<MediaAsset, "mime_type">): boolean {
+  return mediaKind(media) === "image";
 }
 
 export function mediaDevice(media: MediaAsset): DeviceInfo | null {

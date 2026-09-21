@@ -24,6 +24,24 @@ Supabase Edge Function secrets (see below) and must never be exposed with a
 
 ---
 
+## Media access (server-side; optional but recommended)
+
+The media viewer never hands the browser a permanent `storage_url` /
+`thumbnail_url`. It hands it a short-lived signed admin route
+(`/admin/media/<userId>/asset/<mediaId>?e=<expiry>&t=<signature>`), which the
+server verifies before streaming the bytes. These variables configure that
+layer and must never be given a `NEXT_PUBLIC_*` prefix.
+
+| Variable | Description |
+|---|---|
+| `MEDIA_ACCESS_TOKEN_SECRET` | HMAC key for media access grants. If unset, `SUPABASE_SERVICE_ROLE_KEY` is used; failing that the public anon key is used, which still binds a grant to one employee and an expiry but is not secret. Setting this makes the signature confidential as well — recommended in production. |
+| `MEDIA_ASSET_ALLOWED_HOSTS` | Optional comma-separated allowlist of hostnames the media proxy may fetch (for example `ik.imagekit.io,res.cloudinary.com`). When set it replaces the default guard, which allows any public hostname but never loopback, link-local, private-network or bare-IP destinations. |
+
+Grants expire after one hour, and the viewer renews one on demand when it reports
+a load failure, so no long-lived media URL is held in client state.
+
+---
+
 ## Supabase Edge Function Secrets
 
 These are set via the Supabase CLI or Dashboard and are injected as Deno
@@ -107,6 +125,8 @@ broader Drive scope is requested.
 - `NEXT_PUBLIC_SUPABASE_SERVICE_ROLE_KEY`
 - `NEXT_PUBLIC_GOOGLE_REFRESH_TOKEN`
 - `NEXT_PUBLIC_ENCRYPTION_KEY`
+- `NEXT_PUBLIC_MEDIA_ACCESS_TOKEN_SECRET`
+- `NEXT_PUBLIC_MEDIA_ASSET_ALLOWED_HOSTS`
 
 **Google Client Secret** must remain server-side only.
 

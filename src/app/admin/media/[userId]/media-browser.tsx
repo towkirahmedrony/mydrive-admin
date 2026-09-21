@@ -1,89 +1,76 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- thumbnails stream through the
+   authenticated asset route; next/image would re-encode them. */
+
 import { useCallback, useEffect, useMemo, useState, useTransition } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import EmptyState from "@/components/EmptyState";
+import MediaInfoPanel from "@/components/MediaInfoPanel";
 import StatusBadge from "@/components/StatusBadge";
-import { formatBytes, formatTimestamp, type Tone } from "@/lib/format";
+import { formatBytes, formatTimestamp } from "@/lib/format";
+import {
+  archiveLabel,
+  cleanupLabel,
+  cleanupTone,
+  jobTone,
+} from "@/lib/media-display";
 import {
   jobFor,
-  mediaDevice,
-  mediaJobs,
+  mediaAssetPath,
+  mediaKind,
   type BackupSessionInfo,
+  type MediaAccessGrant,
   type MediaAsset,
 } from "@/lib/media-types";
-import { retryEmployeeMediaJobs } from "../actions";
+import { refreshMediaAccess, retryEmployeeMediaJobs } from "../actions";
+import MediaViewer from "./media-viewer";
 
 type ViewMode = "grid" | "list";
 
-function isVideo(media: MediaAsset): boolean {
-  return media.mime_type?.toLowerCase().startsWith("video/") ?? false;
-}
-
-function jobTone(status: string | undefined): Tone {
-  if (status === "COMPLETED") return "success";
-  if (status === "FAILED") return "danger";
-  if (status) return "warning";
-  return "neutral";
-}
-
-function cleanupTone(status: string | null | undefined): Tone {
-  if (status === "cleanup_success") return "success";
-  if (status === "cleanup_failed") return "danger";
-  if (status === "cleanup_pending" || status === "cleanup_processing") return "warning";
-  return "neutral";
-}
-
-function cleanupLabel(status: string | null | undefined): string {
-  switch (status) {
-    case "cleanup_pending":
-      return "Cleanup pending";
-    case "cleanup_processing":
-      return "Cleanup processing";
-    case "cleanup_success":
-      return "Cleanup success";
-    case "cleanup_failed":
-      return "Cleanup failed";
-    default:
-      return "Cleanup none";
-  }
-}
-
-function archiveLabel(media: MediaAsset): string {
-  return media.drive_archived_at ? "Drive verified" : "Not archived";
-}
-
-function deviceLabel(media: MediaAsset): string {
-  const device = mediaDevice(media);
-  if (!device) return "Unknown device";
-  return (
-    device.device_name ||
-    [device.brand, device.model].filter(Boolean).join(" ") ||
-    "Unnamed device"
+/**
+ * Thumbnails come from the signed asset route, never from
+ * `media_assets.thumbnail_url` directly — that permanent provider URL stays on
+ * the server. A missing preview (no derived thumbnail, or a file the provider
+ * cannot serve) degrades to the same placeholder the grid always used.
+ */
+function Thumbnail({
+  media,
+  userId,
+  access,
+  fit = "cover",
+}: {
+  media: MediaAsset;
+  userId: string;
+  access: MediaAccessGrant;
+  fit?: "cover" | "contain";
+}) {
+  const [failed, setFailed] = useState(false);
+  const kind = mediaKind(media);
+  const src = useMemo(
+    () => mediaAssetPath(userId, media.id, access, "thumb"),
+    [media, userId, access],
   );
-}
 
-function durationLabel(value: number | string | null | undefined): string {
-  const n = typeof value === "string" ? Number(value) : value;
-  if (!n || !Number.isFinite(n)) return "—";
-  return `${Math.round(n / 1000)}s`;
-}
-
-function Thumbnail({ media }: { media: MediaAsset }) {
-  const video = isVideo(media);
-  if (media.thumbnail_url && !video) {
+  if (kind === "image" && !failed) {
     return (
       <img
-        src={media.thumbnail_url}
+        src={src}
         alt=""
         loading="lazy"
-        className="h-full w-full object-cover"
+        onError={() => setFailed(true)}
+        className={`h-full w-full ${fit === "cover" ? "object-cover" : "object-contain"}`}
       />
     );
   }
+
   return (
-    <div className={`flex h-full items-center justify-center ${video ? "bg-slate-900 text-white" : "bg-gray-100 text-gray-400"}`}>
-      <span className="text-2xl">{video ? "▶" : "▣"}</span>
+    <div
+      className={`flex h-full w-full items-center justify-center ${
+        kind === "video" ? "bg-slate-900 text-white" : "bg-gray-100 text-gray-400"
+      }`}
+    >
+      <span className="text-2xl">{kind === "video" ? "▶" : "▣"}</span>
     </div>
   );
 }
@@ -95,6 +82,7 @@ export default function MediaBrowser({
   designation,
   media,
   sessionsByDevice,
+  access: initialAccess,
 }: {
   userId: string;
   employeeName: string;
@@ -102,6 +90,7 @@ export default function MediaBrowser({
   designation: string | null;
   media: MediaAsset[];
   sessionsByDevice: Record<string, BackupSessionInfo>;
+  access: MediaAccessGrant;
 }) {
   const router = useRouter();
   const pathname = usePathname();
@@ -112,6 +101,8 @@ export default function MediaBrowser({
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
   const [filtersOpen, setFiltersOpen] = useState(false);
+  const [access, setAccess] = useState<MediaAccessGrant>(initialAccess);
+  const [viewerId, setViewerId] = useState<string | null>(null);
 
   const view = (searchParams.get("view") === "list" ? "list" : "grid") as ViewMode;
   const q = searchParams.get("q") ?? "";
@@ -129,6 +120,44 @@ export default function MediaBrowser({
     [media, selected],
   );
   const allSelected = media.length > 0 && media.every((item) => selected.has(item.id));
+
+  /**
+   * The viewer navigates this list and only this list.
+   *
+   * `media` is already the filtered/sorted page for one employee (the query is
+   * scoped by `owner_id`), so previous/next honours the active search, kind,
+   * status and sort filters while staying inside the selected employee. The
+   * owner check is re-applied here as a hard guard: a foreign row can never
+   * become reachable from the viewer.
+   */
+  const viewerItems = useMemo(
+    () => media.filter((item) => item.owner_id === userId),
+    [media, userId],
+  );
+  const viewerIndex = viewerId
+    ? viewerItems.findIndex((item) => item.id === viewerId)
+    : -1;
+
+  // If filters, sort or pagination change the list under an open viewer, close
+  // it rather than leaving the viewer pointing at an index that no longer exists.
+  useEffect(() => {
+    if (viewerId && viewerIndex === -1) setViewerId(null);
+  }, [viewerId, viewerIndex]);
+
+  const openViewer = useCallback((mediaId: string) => {
+    setDetail(null);
+    setViewerId(mediaId);
+  }, []);
+
+  const closeViewer = useCallback(() => setViewerId(null), []);
+
+  /** Renews the short-lived grant when the viewer reports a load failure. */
+  const renewAccess = useCallback(async (): Promise<MediaAccessGrant | null> => {
+    const result = await refreshMediaAccess(userId);
+    if (!result.success || !result.grant) return null;
+    setAccess(result.grant);
+    return result.grant;
+  }, [userId]);
 
   const setParam = useCallback((key: string, value: string) => {
     const next = new URLSearchParams(searchParams.toString());
@@ -186,6 +215,8 @@ export default function MediaBrowser({
   }
 
   const selectClass = "rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm";
+  const rowActionClass =
+    "rounded-md border border-gray-300 bg-white px-2.5 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500";
   const activeFilterCount = [
     q,
     kind !== "ALL" ? kind : "",
@@ -321,14 +352,21 @@ export default function MediaBrowser({
         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
           {media.map((item) => {
             const drive = jobFor(item, "google_drive");
-            const video = isVideo(item);
+            const video = mediaKind(item) === "video";
             return (
               <article
                 key={item.id}
                 className={`group overflow-hidden rounded-xl border bg-white shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${selected.has(item.id) ? "border-primary-500 ring-2 ring-primary-100" : "border-gray-200"}`}
               >
                 <div className="relative aspect-[4/3] bg-gray-100">
-                  <Thumbnail media={item} />
+                  <button
+                    type="button"
+                    onClick={() => openViewer(item.id)}
+                    aria-label={`View ${item.file_name || item.id}`}
+                    className="absolute inset-0 h-full w-full cursor-zoom-in focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary-500"
+                  >
+                    <Thumbnail media={item} userId={userId} access={access} />
+                  </button>
                   <label className="absolute left-3 top-3 rounded-md bg-white/95 p-1.5 shadow-sm" onClick={(event) => event.stopPropagation()}>
                     <input
                       type="checkbox"
@@ -338,14 +376,23 @@ export default function MediaBrowser({
                       className="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
                     />
                   </label>
-                  {video && <span className="absolute right-3 top-3 rounded-full bg-black/65 px-2 py-1 text-xs font-semibold text-white">VIDEO</span>}
-                  <button
-                    type="button"
-                    onClick={() => setDetail(item)}
-                    className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/70 to-transparent px-4 pb-3 pt-8 text-left text-white opacity-0 transition group-hover:opacity-100 focus:opacity-100"
-                  >
-                    Open details
-                  </button>
+                  {video && <span className="pointer-events-none absolute right-3 top-3 rounded-full bg-black/65 px-2 py-1 text-xs font-semibold text-white">VIDEO</span>}
+                  <div className="absolute inset-x-0 bottom-0 flex justify-end gap-2 bg-gradient-to-t from-black/70 to-transparent px-3 pb-3 pt-8 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+                    <button
+                      type="button"
+                      onClick={() => openViewer(item.id)}
+                      className="rounded-md bg-white/95 px-2.5 py-1.5 text-xs font-semibold text-gray-900 transition hover:bg-white focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500"
+                    >
+                      View
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDetail(item)}
+                      className="rounded-md border border-white/40 bg-black/40 px-2.5 py-1.5 text-xs font-medium text-white transition hover:bg-black/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
+                    >
+                      Details
+                    </button>
+                  </div>
                 </div>
                 <div className="space-y-3 p-4">
                   <div className="min-w-0">
@@ -383,23 +430,24 @@ export default function MediaBrowser({
                   <th className="px-4 py-3">Date</th>
                   <th className="px-4 py-3">Archive</th>
                   <th className="px-4 py-3">Cleanup</th>
+                  <th className="px-4 py-3">Open</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {media.map((item) => (
-                  <tr key={item.id} className="cursor-pointer hover:bg-gray-50" onClick={() => setDetail(item)}>
+                  <tr key={item.id} className="cursor-zoom-in hover:bg-gray-50" onClick={() => openViewer(item.id)}>
                     <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
                       <input type="checkbox" checked={selected.has(item.id)} onChange={() => toggle(item.id)} className="h-4 w-4 rounded border-gray-300 text-primary-600" />
                     </td>
                     <td className="px-4 py-3">
                       <div className="h-12 w-16 overflow-hidden rounded bg-gray-100">
-                        <Thumbnail media={item} />
+                        <Thumbnail media={item} userId={userId} access={access} />
                       </div>
                     </td>
                     <td className="max-w-xs px-4 py-3">
                       <p className="truncate font-medium text-gray-900">{item.file_name || item.id}</p>
                     </td>
-                    <td className="px-4 py-3 text-gray-600">{isVideo(item) ? "Video" : "Image"}</td>
+                    <td className="px-4 py-3 text-gray-600">{mediaKind(item) === "video" ? "Video" : "Image"}</td>
                     <td className="px-4 py-3 text-gray-600">{formatBytes(item.file_size) ?? "—"}</td>
                     <td className="px-4 py-3 text-gray-600">{formatTimestamp(item.uploaded_at || item.created_at) ?? "—"}</td>
                     <td className="px-4 py-3">
@@ -407,6 +455,16 @@ export default function MediaBrowser({
                     </td>
                     <td className="px-4 py-3">
                       <StatusBadge label={cleanupLabel(item.primary_cleanup_status)} tone={cleanupTone(item.primary_cleanup_status)} />
+                    </td>
+                    <td className="px-4 py-3" onClick={(event) => event.stopPropagation()}>
+                      <div className="flex gap-2">
+                        <button type="button" onClick={() => openViewer(item.id)} className={rowActionClass}>
+                          View
+                        </button>
+                        <button type="button" onClick={() => setDetail(item)} className={rowActionClass}>
+                          Details
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -419,11 +477,33 @@ export default function MediaBrowser({
       {detail && (
         <MediaDetail
           media={detail}
+          userId={userId}
+          access={access}
           employeeName={employeeName}
           employeeId={employeeId}
           designation={designation}
           session={detail.device_id ? sessionsByDevice[detail.device_id] ?? null : null}
           onClose={() => setDetail(null)}
+          onView={openViewer}
+        />
+      )}
+
+      {viewerId && viewerIndex >= 0 && (
+        <MediaViewer
+          userId={userId}
+          items={viewerItems}
+          index={viewerIndex}
+          access={access}
+          employeeName={employeeName}
+          employeeId={employeeId}
+          designation={designation}
+          sessionsByDevice={sessionsByDevice}
+          onIndexChange={(next) => {
+            const target = viewerItems[next];
+            if (target) setViewerId(target.id);
+          }}
+          onRenewAccess={renewAccess}
+          onClose={closeViewer}
         />
       )}
     </div>
@@ -432,51 +512,25 @@ export default function MediaBrowser({
 
 function MediaDetail({
   media,
+  userId,
+  access,
   employeeName,
   employeeId,
   designation,
   session,
   onClose,
+  onView,
 }: {
   media: MediaAsset;
+  userId: string;
+  access: MediaAccessGrant;
   employeeName: string;
   employeeId: string | null;
   designation: string | null;
   session: BackupSessionInfo | null;
   onClose: () => void;
+  onView: (mediaId: string) => void;
 }) {
-  const device = mediaDevice(media);
-  const jobs = mediaJobs(media);
-  const drive = jobFor(media, "google_drive");
-  const telegram = jobFor(media, "telegram");
-
-  const rows: Array<[string, string]> = [
-    ["Media ID", media.id],
-    ["Filename", media.file_name || "—"],
-    ["Type", media.mime_type || "—"],
-    ["Size", formatBytes(media.file_size) ?? "—"],
-    ["Dimensions", media.width && media.height ? `${media.width} × ${media.height}` : "—"],
-    ["Duration", durationLabel(media.duration_ms)],
-    ["Created", formatTimestamp(media.created_at) ?? "—"],
-    ["Uploaded", formatTimestamp(media.uploaded_at) ?? "—"],
-    ["Employee", employeeName],
-    ["Employee ID", employeeId || "Not assigned"],
-    ["Designation", designation || "Not assigned"],
-    ["Cloudinary / origin", media.status],
-    ["Storage provider", media.storage_provider || "—"],
-    ["Drive archive", media.drive_archived_at ? `Verified ${formatTimestamp(media.drive_archived_at)}` : "Not archived"],
-    ["Drive job", drive?.status || "—"],
-    ["Telegram job", telegram?.status || "—"],
-    ["Cleanup", cleanupLabel(media.primary_cleanup_status)],
-    ["Cleanup completed", formatTimestamp(media.primary_cleanup_completed_at) ?? "—"],
-    ["Primary deleted", formatTimestamp(media.primary_deleted_at) ?? "—"],
-    ["Source device", device ? deviceLabel(media) : "—"],
-    ["Device ID", device?.device_uid || device?.id || "—"],
-    ["Backup session", session?.id || "—"],
-    ["Backup date", formatTimestamp(session?.started_at) ?? "—"],
-    ["Session status", session?.status || "—"],
-  ];
-
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/40" role="dialog" aria-modal="true" aria-label="Media details" onClick={onClose}>
       <aside className="h-full w-full max-w-xl overflow-y-auto bg-white p-6 shadow-2xl" onClick={(event) => event.stopPropagation()}>
@@ -489,39 +543,26 @@ function MediaDetail({
             ×
           </button>
         </div>
-        <div className="mt-6 overflow-hidden rounded-xl bg-gray-100">
-          {isVideo(media) ? (
-            <div className="flex aspect-video items-center justify-center bg-slate-900 text-5xl text-white">▶</div>
-          ) : media.thumbnail_url || media.storage_url ? (
-            <img src={media.thumbnail_url || media.storage_url || ""} alt="Media preview" className="max-h-80 w-full object-contain" />
-          ) : (
-            <div className="flex h-48 items-center justify-center text-5xl text-gray-300">▣</div>
-          )}
+
+        <button
+          type="button"
+          onClick={() => onView(media.id)}
+          className="mt-6 block h-72 w-full overflow-hidden rounded-xl bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-500"
+          aria-label={`Open ${media.file_name || media.id} in the viewer`}
+        >
+          <Thumbnail media={media} userId={userId} access={access} fit="contain" />
+        </button>
+        <p className="mt-2 text-center text-xs text-gray-500">Open in viewer</p>
+
+        <div className="mt-6">
+          <MediaInfoPanel
+            media={media}
+            employeeName={employeeName}
+            employeeId={employeeId}
+            designation={designation}
+            session={session}
+          />
         </div>
-        <dl className="mt-6 divide-y divide-gray-100">
-          {rows.map(([label, value]) => (
-            <div key={label} className="grid grid-cols-[9rem_1fr] gap-4 py-3 text-sm">
-              <dt className="text-gray-500">{label}</dt>
-              <dd className="break-words font-medium text-gray-900">{value}</dd>
-            </div>
-          ))}
-        </dl>
-        {jobs.length > 0 && (
-          <div className="mt-6">
-            <h3 className="text-sm font-semibold text-gray-900">Replication jobs</h3>
-            <ul className="mt-3 space-y-2">
-              {jobs.map((job) => (
-                <li key={job.id} className="rounded-lg border border-gray-200 px-3 py-2 text-sm">
-                  <div className="flex items-center justify-between gap-3">
-                    <span className="font-medium text-gray-900">{job.destination_type === "google_drive" ? "Google Drive" : "Telegram"}</span>
-                    <StatusBadge label={job.status} tone={jobTone(job.status)} />
-                  </div>
-                  {job.last_error && <p className="mt-1 text-xs text-red-600">{job.last_error}</p>}
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
       </aside>
     </div>
   );
