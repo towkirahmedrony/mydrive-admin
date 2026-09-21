@@ -105,18 +105,41 @@ const PASSTHROUGH_HEADERS = [
   "last-modified",
 ] as const;
 
+/**
+ * How long a response may be reused by the admin's own browser.
+ *
+ * Thumbnails are small, immutable per file and safe to hold; a large original
+ * is not worth pinning in a browser cache, so its lifetime stays short and
+ * correctness comes from revalidation instead. Both are capped by the signed
+ * grant's remaining life, and both stay `private` so no shared or CDN cache can
+ * ever hold an employee's media.
+ */
+const THUMB_CACHE_MAX_AGE = 6 * 60 * 60;
+const ORIGINAL_CACHE_MAX_AGE = 10 * 60;
+
 function buildStreamHeaders(
   upstream: Response,
   media: MediaAssetSource,
   expiresAt: number,
   source: "cloudinary" | "drive-archive",
+  variant: MediaVariant,
   integrity?: string,
 ): Headers {
-  const remaining = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
+  // Never outlive the grant that authorises this exact url.
+  const grantRemaining = Math.max(
+    60,
+    expiresAt - Math.floor(Date.now() / 1000),
+  );
+  const staleWhileRevalidate = variant === "thumb"
+    ? `, stale-while-revalidate=${THUMB_CACHE_MAX_AGE}`
+    : "";
+
   const headers = new Headers({
-    // The grant is what expires, so the response is cached privately only for
-    // the remainder of its lifetime and never by a shared/CDN cache.
-    "Cache-Control": `private, max-age=${remaining}`,
+    "Cache-Control": `private, max-age=${
+      variant === "thumb"
+        ? Math.min(grantRemaining, THUMB_CACHE_MAX_AGE)
+        : Math.min(grantRemaining, ORIGINAL_CACHE_MAX_AGE)
+    }${staleWhileRevalidate}`,
     "X-Content-Type-Options": "nosniff",
     "Content-Disposition": contentDisposition(media),
     "X-MyDrive-Media-Source": source,
@@ -334,6 +357,7 @@ export async function GET(
           media,
           expiresAt,
           "cloudinary",
+          variant,
         ),
       });
     }
@@ -359,12 +383,28 @@ export async function GET(
       variant,
       accessToken,
       range: request.headers.get("range"),
+      // Let the archive answer a conditional request with 304 instead of
+      // re-sending bytes the admin's browser already has.
+      ifNoneMatch: request.headers.get("if-none-match"),
       // Thumbnails are small and latency-sensitive; an original streams and may
       // legitimately take much longer to transfer.
       timeoutMs: variant === "thumb" ? 30_000 : 600_000,
     });
 
     if (archive.ok) {
+      if (archive.upstream.status === 304) {
+        return new Response(null, {
+          status: 304,
+          headers: buildStreamHeaders(
+            archive.upstream,
+            media,
+            expiresAt,
+            "drive-archive",
+            variant,
+            archive.integrity,
+          ),
+        });
+      }
       return new Response(archive.upstream.body, {
         status: archive.upstream.status,
         statusText: archive.upstream.statusText,
@@ -373,6 +413,7 @@ export async function GET(
           media,
           expiresAt,
           "drive-archive",
+          variant,
           archive.integrity,
         ),
       });

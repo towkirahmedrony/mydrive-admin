@@ -75,6 +75,14 @@ export async function middleware(request: NextRequest) {
 
 export const config = {
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
+    // The signed asset route is deliberately excluded.
+    //
+    // It is fetched once per thumbnail, poster and range request, and it
+    // performs its own, stronger checks (Supabase session, admin role, signed
+    // grant with expiry, employee ownership scoping). Running this middleware
+    // first meant every one of those requests paid two extra Supabase round
+    // trips for a decision the route makes again anyway — a grid of 24 tiles
+    // paid roughly 48 avoidable network calls per page load.
+    "/((?!_next/static|_next/image|favicon.ico|admin/media/[^/]+/asset/|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)",
   ],
 };

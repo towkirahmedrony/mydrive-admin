@@ -34,10 +34,17 @@
  * signature confidential as well.
  */
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { MEDIA_ACCESS_TTL_SECONDS, type MediaAccessGrant } from "@/lib/media-types";
+import { type MediaAccessGrant } from "./media-types";
 
-/** Upper bound accepted when verifying, so a forged far-future expiry is rejected. */
-const MAX_TOKEN_LIFETIME_SECONDS = 12 * 60 * 60;
+/**
+ * Length of the url-stability window.
+ *
+ * Six hours keeps the signed url identical across a working session (so the
+ * browser serves thumbnails from cache) while keeping a leaked url's useful
+ * life short. `verifyMediaAccess` accepts the neighbouring windows too, so a url
+ * minted a moment before a boundary keeps working across it.
+ */
+const MEDIA_ACCESS_WINDOW_SECONDS = 6 * 60 * 60;
 
 function signingKey(): string {
   const dedicated = process.env.MEDIA_ACCESS_TOKEN_SECRET?.trim();
@@ -49,24 +56,40 @@ function signingKey(): string {
 
 function sign(userId: string, expiresAt: number): string {
   return createHmac("sha256", signingKey())
-    .update(`media-access.v1.${userId}.${expiresAt}`)
+    .update(`media-access.v2.${userId}.${expiresAt}`)
     .digest("base64url");
 }
 
+/**
+ * The end of the window a grant belongs to.
+ *
+ * Grants are anchored to a fixed window instead of "now + TTL" so that two
+ * renders in the same window mint the SAME url. That is what makes browser
+ * caching work at all: a per-render expiry produced a new `?e=&t=` pair on
+ * every page load, so every thumbnail was a cache miss and every refresh paid
+ * for a full round of Drive traffic again.
+ *
+ * `offset` selects the previous or next window, which lets a url minted just
+ * before a boundary keep working just after it.
+ */
+function windowEnd(offset: number, now = Math.floor(Date.now() / 1000)): number {
+  const index = Math.floor(now / MEDIA_ACCESS_WINDOW_SECONDS) + offset;
+  return (index + 1) * MEDIA_ACCESS_WINDOW_SECONDS;
+}
+
 /** Mints a grant for one employee's media set. Server-side callers only. */
-export function issueMediaAccess(
-  userId: string,
-  ttlSeconds: number = MEDIA_ACCESS_TTL_SECONDS,
-): MediaAccessGrant {
-  const ttl = Math.min(
-    Math.max(60, Math.trunc(ttlSeconds) || MEDIA_ACCESS_TTL_SECONDS),
-    MAX_TOKEN_LIFETIME_SECONDS,
-  );
-  const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+export function issueMediaAccess(userId: string): MediaAccessGrant {
+  const expiresAt = windowEnd(0);
   return { token: sign(userId, expiresAt), expiresAt };
 }
 
-/** Constant-time verification of a grant presented by the browser. */
+/**
+ * Constant-time verification of a grant presented by the browser.
+ *
+ * Accepts the current, previous and next window so a cached url does not stop
+ * working at a window boundary, and rejects any expiry outside that band — a
+ * far-future expiry cannot be forged into a long-lived url.
+ */
 export function verifyMediaAccess(input: {
   userId: string;
   token: string | null | undefined;
@@ -77,10 +100,10 @@ export function verifyMediaAccess(input: {
   if (!Number.isFinite(expiresAt)) return false;
 
   const now = Math.floor(Date.now() / 1000);
-  if (expiresAt <= now) return false;
-  if (expiresAt > now + MAX_TOKEN_LIFETIME_SECONDS) return false;
+  const allowed = new Set([windowEnd(-1, now), windowEnd(0, now), windowEnd(1, now)]);
+  if (!allowed.has(Math.trunc(expiresAt))) return false;
 
-  const expected = Buffer.from(sign(userId, expiresAt), "utf8");
+  const expected = Buffer.from(sign(userId, Math.trunc(expiresAt)), "utf8");
   const received = Buffer.from(token, "utf8");
   if (expected.length !== received.length) return false;
   return timingSafeEqual(expected, received);

@@ -30,6 +30,13 @@ import MediaViewer from "./media-viewer";
 type ViewMode = "grid" | "list";
 
 /**
+ * How many tiles load eagerly. A 3-column grid at 1080p shows about six cards
+ * above the fold, so this covers the first screen without asking for more than
+ * the viewer can see.
+ */
+const EAGER_TILE_COUNT = 6;
+
+/**
  * Thumbnails come from the signed asset route, never from
  * `media_assets.thumbnail_url` directly — that permanent provider URL stays on
  * the server. A missing preview (no derived thumbnail, or a file the provider
@@ -40,11 +47,18 @@ function Thumbnail({
   userId,
   access,
   fit = "cover",
+  aboveFold = false,
 }: {
   media: MediaAsset;
   userId: string;
   access: MediaAccessGrant;
   fit?: "cover" | "contain";
+  /**
+   * The first screen of tiles loads eagerly with a high priority so the grid
+   * shows media immediately; everything below the fold stays lazy so a page of
+   * 24 tiles never competes for bandwidth with the ones the admin can see.
+   */
+  aboveFold?: boolean;
 }) {
   const [failed, setFailed] = useState(false);
   const kind = mediaKind(media);
@@ -58,7 +72,9 @@ function Thumbnail({
       <img
         src={src}
         alt=""
-        loading="lazy"
+        loading={aboveFold ? "eager" : "lazy"}
+        fetchPriority={aboveFold ? "high" : "auto"}
+        decoding="async"
         onError={() => setFailed(true)}
         className={`h-full w-full ${fit === "cover" ? "object-cover" : "object-contain"}`}
       />
@@ -351,7 +367,7 @@ export default function MediaBrowser({
         />
       ) : view === "grid" ? (
         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
-          {media.map((item) => {
+          {media.map((item, gridIndex) => {
             const drive = jobFor(item, "google_drive");
             const video = mediaKind(item) === "video";
             return (
@@ -366,7 +382,12 @@ export default function MediaBrowser({
                     aria-label={`View ${item.file_name || item.id}`}
                     className="absolute inset-0 h-full w-full cursor-zoom-in focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary-500"
                   >
-                    <Thumbnail media={item} userId={userId} access={access} />
+                    <Thumbnail
+                      media={item}
+                      userId={userId}
+                      access={access}
+                      aboveFold={gridIndex < EAGER_TILE_COUNT}
+                    />
                   </button>
                   <label className="absolute left-3 top-3 rounded-md bg-white/95 p-1.5 shadow-sm" onClick={(event) => event.stopPropagation()}>
                     <input

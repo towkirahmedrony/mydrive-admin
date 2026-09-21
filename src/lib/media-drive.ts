@@ -107,6 +107,8 @@ export async function openArchivedMedia(params: {
   variant: "thumb" | "original";
   accessToken: string | null;
   range?: string | null;
+  /** The browser's validator, forwarded so the archive can answer 304. */
+  ifNoneMatch?: string | null;
   timeoutMs?: number;
 }): Promise<ArchiveReadResult> {
   if (!params.accessToken) {
@@ -136,6 +138,7 @@ export async function openArchivedMedia(params: {
     "Content-Type": "application/json",
   };
   if (params.range) headers.Range = params.range;
+  if (params.ifNoneMatch) headers["If-None-Match"] = params.ifNoneMatch;
 
   let upstream: Response;
   try {
@@ -164,7 +167,8 @@ export async function openArchivedMedia(params: {
     };
   }
 
-  if (upstream.ok || upstream.status === 206) {
+  // 304 is a success: the browser's cached copy is still current.
+  if (upstream.ok || upstream.status === 206 || upstream.status === 304) {
     return {
       ok: true,
       upstream,

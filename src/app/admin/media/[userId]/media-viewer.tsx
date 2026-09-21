@@ -503,6 +503,27 @@ export default function MediaViewer({
     setLoadState("ready");
   }, []);
 
+  /**
+   * Warm the neighbouring thumbnails once the current item is actually on
+   * screen.
+   *
+   * Only thumbnails, and only the two direct neighbours: the viewer's urls are
+   * stable, so this is usually a cache hit on tiles the grid already loaded and
+   * makes previous/next instant. No original is ever preloaded, so opening one
+   * photo never competes with two speculative full-size downloads.
+   */
+  useEffect(() => {
+    if (loadState !== "ready" || !media) return;
+    const neighbours = [index - 1, index + 1].filter(
+      (candidate) => candidate >= 0 && candidate < items.length,
+    );
+    for (const candidate of neighbours) {
+      const warmer = new Image();
+      warmer.decoding = "async";
+      warmer.src = mediaAssetPath(userId, items[candidate].id, access, "thumb");
+    }
+  }, [loadState, index, items, media, userId, access]);
+
   /* -------------------------------------------------------------- keyboard/aria */
 
   const trapFocus = useCallback((event: KeyboardEvent) => {

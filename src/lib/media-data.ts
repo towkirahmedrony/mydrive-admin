@@ -125,6 +125,37 @@ export type AdminActorResult =
  * route. Always called with the request-scoped Supabase client so the check
  * runs against the caller's own session.
  */
+/**
+ * Role lookups are cached for a few seconds per server instance.
+ *
+ * The session itself is still verified on every request (`auth.getUser()` is a
+ * real check and is not cached); only the follow-up `profiles.role` read is
+ * reused. A media grid issues dozens of requests in a burst, and this removes
+ * one database round trip from each of them. The window is deliberately short,
+ * so a revoked admin loses access almost immediately.
+ */
+const ROLE_CACHE_TTL_MS = 10_000;
+const roleCache = new Map<string, { isAdmin: boolean; expiresAt: number }>();
+
+async function isAdminUser(supabase: Client, userId: string): Promise<boolean> {
+  const cached = roleCache.get(userId);
+  if (cached && cached.expiresAt > Date.now()) return cached.isAdmin;
+
+  const { data: actor } = await supabase
+    .from("profiles")
+    .select("role")
+    .eq("id", userId)
+    .maybeSingle();
+
+  const isAdmin = (actor as { role?: string } | null)?.role === "admin";
+  roleCache.set(userId, { isAdmin, expiresAt: Date.now() + ROLE_CACHE_TTL_MS });
+  if (roleCache.size > 256) {
+    const oldest = roleCache.keys().next().value;
+    if (oldest !== undefined) roleCache.delete(oldest);
+  }
+  return isAdmin;
+}
+
 export async function requireAdminActor(
   supabase: Client,
 ): Promise<AdminActorResult> {
@@ -133,12 +164,7 @@ export async function requireAdminActor(
   } = await supabase.auth.getUser();
   if (!user) return { ok: false, error: "Not authenticated." };
 
-  const { data: actor } = await supabase
-    .from("profiles")
-    .select("id,role")
-    .eq("id", user.id)
-    .maybeSingle();
-  if (!actor || actor.role !== "admin") {
+  if (!(await isAdminUser(supabase, user.id))) {
     return { ok: false, error: "Not authorized." };
   }
 
@@ -443,11 +469,31 @@ export type MediaAssetSource = {
  * The returned row is never serialised to the browser: it carries the permanent
  * storage URL, which must stay server-side.
  */
+/**
+ * Short-lived cache of the source facts for one media row.
+ *
+ * A grid tile, its hover preview, its poster and the viewer all ask for the same
+ * row within seconds. Caching the small resolved shape (provider URL, cleanup
+ * state, archive availability) avoids repeating the same query — and its joined
+ * replication job — for every one of those requests.
+ *
+ * Nothing credential-bearing is stored, and the cached value is per server
+ * instance and per media id, never shared across employees: the owner check
+ * below is still performed from the query result that populated it.
+ */
+const SOURCE_CACHE_TTL_MS = 30_000;
+const sourceCache = new Map<string, { value: MediaAssetSource | null; expiresAt: number }>();
+
 export async function loadMediaForAsset(
   userId: string,
   mediaId: string,
 ): Promise<{ media: MediaAssetSource | null; error: string | null }> {
   if (!isUuid(userId) || !isUuid(mediaId)) return { media: null, error: null };
+
+  const cached = sourceCache.get(`${userId}:${mediaId}`);
+  if (cached && cached.expiresAt > Date.now()) {
+    return { media: cached.value, error: null };
+  }
 
   const supabase = await createClient();
   const { data, error } = await supabase
@@ -487,6 +533,15 @@ export async function loadMediaForAsset(
         (driveJob.google_drive_file_id as string).trim().length > 0,
     ),
   };
+
+  sourceCache.set(`${userId}:${mediaId}`, {
+    value: media,
+    expiresAt: Date.now() + SOURCE_CACHE_TTL_MS,
+  });
+  if (sourceCache.size > 512) {
+    const oldest = sourceCache.keys().next().value;
+    if (oldest !== undefined) sourceCache.delete(oldest);
+  }
 
   return { media, error: null };
 }
