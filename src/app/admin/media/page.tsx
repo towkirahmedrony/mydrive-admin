@@ -37,15 +37,15 @@ export default async function MediaEmployeesPage({
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
 
   return (
-    <div className="space-y-6">
-      <header className="flex flex-col justify-between gap-4 sm:flex-row sm:items-start">
-        <div>
-          <p className="text-sm font-medium text-primary-600">Office Media Manager</p>
-          <h1 className="mt-1 text-3xl font-bold tracking-tight text-gray-900">Media</h1>
-          <p className="mt-2 text-sm text-gray-500">
+    <div className="space-y-4 sm:space-y-6">
+      <header className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-xs font-medium text-primary-600 sm:text-sm">Office Media Manager</p>
+          <h1 className="mt-0.5 text-2xl font-bold tracking-tight text-gray-900 sm:mt-1 sm:text-3xl">Media</h1>
+          <p className="mt-1 hidden text-sm text-gray-500 sm:mt-2 sm:block">
             Open an employee folder to browse that employee&apos;s media.
           </p>
-          <nav className="mt-3 text-sm text-gray-500" aria-label="Breadcrumb">
+          <nav className="mt-1 text-xs text-gray-500 sm:mt-3 sm:text-sm" aria-label="Breadcrumb">
             <ol className="flex items-center gap-2">
               <li>
                 <Link href="/admin" className="hover:text-gray-700">
@@ -57,27 +57,32 @@ export default async function MediaEmployeesPage({
             </ol>
           </nav>
         </div>
-        <RefreshButton label="Refresh" />
+        <div className="flex shrink-0 items-center gap-2 pt-0.5">
+          <EmployeeSearch defaultValue={search} compact />
+          <RefreshButton label="Refresh" iconOnly />
+        </div>
       </header>
 
-      <section className="grid gap-4 sm:grid-cols-3">
-        <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+      <section className="grid grid-cols-3 gap-2 sm:gap-4">
+        <div className="rounded-lg border border-gray-200 bg-white p-3 shadow-sm sm:rounded-xl sm:p-5">
           <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Employees</p>
-          <p className="mt-2 text-2xl font-bold text-gray-900">{total.toLocaleString()}</p>
+          <p className="mt-1 text-xl font-bold text-gray-900 sm:mt-2 sm:text-2xl">{total.toLocaleString()}</p>
         </div>
-        <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+        <div className="rounded-lg border border-gray-200 bg-white p-3 shadow-sm sm:rounded-xl sm:p-5">
           <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">This page</p>
-          <p className="mt-2 text-2xl font-bold text-gray-900">{employees.length}</p>
-          <p className="mt-1 text-xs text-gray-500">Employee folders</p>
+          <p className="mt-1 text-xl font-bold text-gray-900 sm:mt-2 sm:text-2xl">{employees.length}</p>
+          <p className="mt-0.5 truncate text-[10px] text-gray-500 sm:mt-1 sm:text-xs">Folders</p>
         </div>
-        <div className="rounded-xl border border-gray-200 bg-white p-5 shadow-sm">
+        <div className="rounded-lg border border-gray-200 bg-white p-3 shadow-sm sm:rounded-xl sm:p-5">
           <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Search</p>
-          <p className="mt-2 text-2xl font-bold text-gray-900">{search ? "Filtered" : "All"}</p>
-          <p className="mt-1 text-xs text-gray-500">Name, email, or designation</p>
+          <p className="mt-1 truncate text-xl font-bold text-gray-900 sm:mt-2 sm:text-2xl">{search ? "On" : "All"}</p>
+          <p className="mt-0.5 truncate text-[10px] text-gray-500 sm:mt-1 sm:text-xs">Name / email</p>
         </div>
       </section>
 
-      <EmployeeSearch defaultValue={search} />
+      <div className="hidden sm:block">
+        <EmployeeSearch defaultValue={search} />
+      </div>
 
       {error && (
         <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
