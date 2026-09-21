@@ -41,6 +41,33 @@ export function archiveLabel(media: MediaAsset): string {
   return media.drive_archived_at ? "Drive verified" : "Not archived";
 }
 
+/**
+ * true when the Cloudinary primary is known to be gone while a verified Drive
+ * archive exists — i.e. the archived copy is the only live source and media is
+ * expected to be served from Google Drive.
+ */
+export function servedFromDriveArchive(
+  media: Pick<
+    MediaAsset,
+    "drive_archived" | "primary_cleanup_status" | "primary_deleted_at"
+  >,
+): boolean {
+  if (!media.drive_archived) return false;
+  return media.primary_cleanup_status === "cleanup_success" ||
+    Boolean(media.primary_deleted_at);
+}
+
+/**
+ * Which store a request for this media will be served from, in the same
+ * priority order the asset route applies. Display only — the route re-decides
+ * from the live provider answer.
+ */
+export function sourceLabel(media: MediaAsset): string {
+  if (servedFromDriveArchive(media)) return "Google Drive archive";
+  if (media.drive_archived) return "Cloudinary (Drive copy available)";
+  return "Cloudinary";
+}
+
 export function deviceLabel(media: MediaAsset): string {
   const device = mediaDevice(media);
   if (!device) return "Unknown device";

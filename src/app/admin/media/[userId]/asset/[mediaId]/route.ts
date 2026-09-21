@@ -4,12 +4,24 @@ import {
   isAllowedMediaUpstream,
   verifyMediaAccess,
 } from "@/lib/media-access";
-import { loadMediaForAsset, requireAdminActor } from "@/lib/media-data";
+import { getAdminAccessToken, openArchivedMedia } from "@/lib/media-drive";
+import {
+  planAfterPrimary,
+  planArchiveFailure,
+  planInitialSource,
+  type ArchiveFacts,
+  type MediaFailure,
+} from "@/lib/media-source";
+import {
+  loadMediaForAsset,
+  requireAdminActor,
+  type MediaAssetSource,
+} from "@/lib/media-data";
 import { isUuid, type MediaVariant } from "@/lib/media-types";
 import { createClient } from "@/lib/supabase/server";
 
 /**
- * Signed, admin-only media delivery.
+ * Signed, admin-only media delivery with archive fallback.
  *
  *   GET /admin/media/<userId>/asset/<mediaId>?e=<expiry>&t=<signature>[&variant=thumb]
  *
@@ -23,12 +35,22 @@ import { createClient } from "@/lib/supabase/server";
  *   3. ownership: the asset is looked up with `owner_id = userId` in the query,
  *      so a grant for one employee can never fetch another employee's media.
  *
- * Bytes are then proxied from the provider instead of handing the browser the
- * permanent CDN URL, and the `Range` header is forwarded both ways so video
- * seeks without downloading the whole file.
+ * Source priority — Cloudinary is TEMPORARY, the Drive archive is the record:
  *
- * Nothing here reads a service-role key, a provider API secret or a Telegram
- * token; the browser only ever sees this route.
+ *   1. the current Cloudinary asset, if it actually exists;
+ *   2. the Google Drive archived copy, resolved from the media's own completed
+ *      replication job and read through the `media-drive` Edge Function;
+ *   3. a genuine "no copy available" answer.
+ *
+ * The production lifecycle deletes the Cloudinary original *after* the Drive
+ * copy is verified, so for most historical media step 1 is expected to be
+ * empty. That is a normal, healthy state and must render as the archived file —
+ * not as a missing one. A cleanup status of `cleanup_success` (or a
+ * `primary_deleted_at`), or a 404/410 from Cloudinary, moves the request to the
+ * archive instead of reporting the media as gone.
+ *
+ * Nothing here reads or forwards a Google credential: the Edge Function owns
+ * the Vault-backed token exchange and the browser only ever sees this route.
  */
 
 export const dynamic = "force-dynamic";
@@ -39,15 +61,21 @@ const NO_STORE_HEADERS = {
   "X-Content-Type-Options": "nosniff",
 } as const;
 
-function plain(status: number, message: string, headers: Record<string, string> = {}) {
-  return new Response(message, {
-    status,
-    headers: {
-      ...NO_STORE_HEADERS,
-      "Content-Type": "text/plain; charset=utf-8",
-      ...headers,
+function jsonFailure(failure: MediaFailure) {
+  return new Response(
+    JSON.stringify({
+      error: failure.message,
+      reason: failure.reason,
+      retryable: failure.retryable,
+    }),
+    {
+      status: failure.status,
+      headers: {
+        ...NO_STORE_HEADERS,
+        "Content-Type": "application/json; charset=utf-8",
+      },
     },
-  });
+  );
 }
 
 function asVariant(value: string | null): MediaVariant {
@@ -67,6 +95,141 @@ function contentDisposition(media: {
   return `inline; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(raw)}`;
 }
 
+/** Headers copied from whichever upstream actually served the bytes. */
+const PASSTHROUGH_HEADERS = [
+  "content-type",
+  "content-length",
+  "content-range",
+  "accept-ranges",
+  "etag",
+  "last-modified",
+] as const;
+
+function buildStreamHeaders(
+  upstream: Response,
+  media: MediaAssetSource,
+  expiresAt: number,
+  source: "cloudinary" | "drive-archive",
+  integrity?: string,
+): Headers {
+  const remaining = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
+  const headers = new Headers({
+    // The grant is what expires, so the response is cached privately only for
+    // the remainder of its lifetime and never by a shared/CDN cache.
+    "Cache-Control": `private, max-age=${remaining}`,
+    "X-Content-Type-Options": "nosniff",
+    "Content-Disposition": contentDisposition(media),
+    "X-MyDrive-Media-Source": source,
+  });
+  if (integrity) headers.set("X-MyDrive-Archive-Integrity", integrity);
+
+  for (const header of PASSTHROUGH_HEADERS) {
+    const value = upstream.headers.get(header);
+    if (value) headers.set(header, value);
+  }
+
+  if (!headers.has("content-type")) {
+    headers.set("content-type", media.mime_type || "application/octet-stream");
+  }
+  // Range support is what lets the HTML5 player seek and start playing before
+  // the whole file arrives; advertise it even when the origin omitted it.
+  if (!headers.has("accept-ranges")) headers.set("accept-ranges", "bytes");
+  return headers;
+}
+
+/** What the Cloudinary probe found. */
+type PrimaryProbe =
+  | { outcome: "ok"; response: Response }
+  | { outcome: "missing" }
+  | { outcome: "failed"; failure: MediaFailure };
+
+/**
+ * Probes/serves the temporary Cloudinary original (or a derived preview).
+ *
+ * A 404/410 is reported as `missing` rather than as an error: that is exactly
+ * the expected state after cleanup, and the caller falls through to the archive.
+ */
+async function probePrimary(
+  upstream: string,
+  request: NextRequest,
+): Promise<PrimaryProbe> {
+  const conditional: Record<string, string> = { "Accept-Encoding": "identity" };
+  const range = request.headers.get("range");
+  const ifRange = request.headers.get("if-range");
+  const ifNoneMatch = request.headers.get("if-none-match");
+  const ifModifiedSince = request.headers.get("if-modified-since");
+  if (range) conditional.Range = range;
+  if (ifRange) conditional["If-Range"] = ifRange;
+  if (ifNoneMatch) conditional["If-None-Match"] = ifNoneMatch;
+  if (ifModifiedSince) conditional["If-Modified-Since"] = ifModifiedSince;
+
+  let response: Response;
+  try {
+    response = await fetch(upstream, {
+      headers: conditional,
+      cache: "no-store",
+      redirect: "follow",
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    // A transport failure to the provider is not "the file was deleted".
+    return {
+      outcome: "failed",
+      failure: {
+        status: 504,
+        reason: "provider_unavailable",
+        retryable: true,
+        message: "The media provider could not be reached from the server.",
+      },
+    };
+  }
+
+  // A provider redirect must not become an SSRF hop: re-validate the host the
+  // response actually came from.
+  if (response.redirected && !isAllowedMediaUpstream(response.url)) {
+    return {
+      outcome: "failed",
+      failure: {
+        status: 502,
+        reason: "provider_unavailable",
+        retryable: true,
+        message: "The media provider redirected to an untrusted host.",
+      },
+    };
+  }
+
+  if (response.status === 404 || response.status === 410) {
+    return { outcome: "missing" };
+  }
+
+  if (!response.ok && response.status !== 206) {
+    if (response.status >= 500) {
+      return {
+        outcome: "failed",
+        failure: {
+          status: 502,
+          reason: "provider_unavailable",
+          retryable: true,
+          message: "The media provider is temporarily unavailable.",
+        },
+      };
+    }
+    // A 4xx that is not a plain "gone" answer (401/403/429/…) is a provider
+    // refusal: retryable, and never reported as a deleted file.
+    return {
+      outcome: "failed",
+      failure: {
+        status: response.status === 429 ? 429 : 502,
+        reason: "provider_unavailable",
+        retryable: true,
+        message: "The media provider refused the request.",
+      },
+    };
+  }
+
+  return { outcome: "ok", response };
+}
+
 export async function GET(
   request: NextRequest,
   context: { params: Promise<{ userId: string; mediaId: string }> },
@@ -78,112 +241,151 @@ export async function GET(
   const variant = asVariant(search.get("variant"));
 
   if (!isUuid(userId) || !isUuid(mediaId)) {
-    return plain(404, "Media not found.");
+    return jsonFailure({
+      status: 404,
+      reason: "media_not_found",
+      retryable: false,
+      message: "Media not found.",
+    });
   }
 
   if (!verifyMediaAccess({ userId, token, expiresAt })) {
-    return plain(401, "This media link is invalid or has expired.");
+    return jsonFailure({
+      status: 401,
+      reason: "session_required",
+      retryable: true,
+      message: "This media link is invalid or has expired.",
+    });
   }
 
-  // Session re-check. `revalidate: 0` is not needed: a cookie-bound client is
-  // always request-scoped.
+  // Session re-check. This is the real authorization boundary.
   const supabase = await createClient();
   const actor = await requireAdminActor(supabase);
   if (!actor.ok) {
-    return plain(actor.error === "Not authenticated." ? 401 : 403, actor.error);
+    return jsonFailure(
+      actor.error === "Not authenticated."
+        ? {
+          status: 401,
+          reason: "session_required",
+          retryable: true,
+          message: "Not authenticated.",
+        }
+        : {
+          status: 403,
+          reason: "forbidden",
+          retryable: false,
+          message: "Not authorized.",
+        },
+    );
   }
 
   const { media, error } = await loadMediaForAsset(userId, mediaId);
-  if (error) return plain(502, "Media metadata could not be read.");
-  if (!media) return plain(404, "Media not found.");
-
-  const upstream =
-    variant === "thumb"
-      ? // Prefer a persisted preview, then derive one from the original using
-        // the existing Cloudinary delivery pipeline. Never fall back to the
-        // full-size original for a grid request.
-        media.thumbnail_url || deriveCloudinaryThumbnailUrl(media.storage_url)
-      : media.storage_url;
-
-  if (!isAllowedMediaUpstream(upstream)) {
-    return plain(422, "Media metadata does not contain a valid playable source.");
-  }
-
-  const range = request.headers.get("range");
-  // Media must travel uncompressed: the browser has nothing to decode, and a
-  // transformed body would invalidate the length/range headers we forward.
-  const conditional: Record<string, string> = { "Accept-Encoding": "identity" };
-  const ifRange = request.headers.get("if-range");
-  const ifNoneMatch = request.headers.get("if-none-match");
-  const ifModifiedSince = request.headers.get("if-modified-since");
-  if (range) conditional.Range = range;
-  if (ifRange) conditional["If-Range"] = ifRange;
-  if (ifNoneMatch) conditional["If-None-Match"] = ifNoneMatch;
-  if (ifModifiedSince) conditional["If-Modified-Since"] = ifModifiedSince;
-
-  let upstreamResponse: Response;
-  try {
-    upstreamResponse = await fetch(upstream!, {
-      headers: conditional,
-      cache: "no-store",
-      redirect: "follow",
+  if (error) {
+    return jsonFailure({
+      status: 502,
+      reason: "provider_unavailable",
+      retryable: true,
+      message: "Media metadata could not be read.",
     });
-  } catch {
-    return plain(502, "The media could not be reached from the server.");
+  }
+  if (!media) {
+    return jsonFailure({
+      status: 404,
+      reason: "media_not_found",
+      retryable: false,
+      message: "Media not found.",
+    });
   }
 
-  // A provider redirect must not become an SSRF hop: re-validate the host the
-  // response actually came from.
-  if (upstreamResponse.redirected && !isAllowedMediaUpstream(upstreamResponse.url)) {
-    return plain(502, "The media provider redirected to an untrusted host.");
-  }
+  // Everything the source decision needs. The Drive archive relationship comes
+  // from the media's own completed replication job, never from the request.
+  const facts: ArchiveFacts = {
+    driveArchived: media.drive_archived,
+    cleanupStatus: media.primary_cleanup_status,
+    primaryDeletedAt: media.primary_deleted_at,
+    storageUrl: media.storage_url,
+    // Prefer a persisted preview, then derive one from the original using the
+    // existing Cloudinary delivery pipeline. A grid tile never pulls the
+    // full-size original when the archive can supply a thumbnail.
+    previewUrl: media.thumbnail_url ||
+      deriveCloudinaryThumbnailUrl(media.storage_url),
+    variant,
+    upstreamAllowed: isAllowedMediaUpstream,
+  };
 
-  if (upstreamResponse.status === 304) {
-    return new Response(null, { status: 304, headers: NO_STORE_HEADERS });
-  }
+  // ── 1. The current Cloudinary asset, if it actually exists ──────────────
+  const initial = planInitialSource(facts);
+  let decision:
+    | { action: "use-archive" }
+    | { action: "fail"; failure: MediaFailure };
 
-  if (!upstreamResponse.ok && upstreamResponse.status !== 206) {
-    if (upstreamResponse.status === 404 || upstreamResponse.status === 410) {
-      return plain(404, "This file is no longer available in storage.");
+  if (initial.action === "try-primary") {
+    const probe = await probePrimary(initial.upstream, request);
+
+    if (probe.outcome === "ok") {
+      if (probe.response.status === 304) {
+        return new Response(null, { status: 304, headers: NO_STORE_HEADERS });
+      }
+      return new Response(probe.response.body, {
+        status: probe.response.status,
+        statusText: probe.response.statusText,
+        headers: buildStreamHeaders(
+          probe.response,
+          media,
+          expiresAt,
+          "cloudinary",
+        ),
+      });
     }
-    if (upstreamResponse.status >= 500) {
-      return plain(502, "The media provider is temporarily unavailable.");
+
+    decision = planAfterPrimary(
+      facts,
+      probe.outcome === "missing"
+        ? { outcome: "missing" }
+        : { outcome: "failed", failure: probe.failure },
+    );
+  } else if (initial.action === "use-archive") {
+    decision = { action: "use-archive" };
+  } else {
+    decision = { action: "fail", failure: initial.failure };
+  }
+
+  // ── 2. The Google Drive archived copy ───────────────────────────────────
+  if (decision.action === "use-archive") {
+    const accessToken = await getAdminAccessToken(supabase);
+    const archive = await openArchivedMedia({
+      mediaId: media.id,
+      ownerId: media.owner_id,
+      variant,
+      accessToken,
+      range: request.headers.get("range"),
+      // Thumbnails are small and latency-sensitive; an original streams and may
+      // legitimately take much longer to transfer.
+      timeoutMs: variant === "thumb" ? 30_000 : 600_000,
+    });
+
+    if (archive.ok) {
+      return new Response(archive.upstream.body, {
+        status: archive.upstream.status,
+        statusText: archive.upstream.statusText,
+        headers: buildStreamHeaders(
+          archive.upstream,
+          media,
+          expiresAt,
+          "drive-archive",
+          archive.integrity,
+        ),
+      });
     }
-    return plain(502, "The media provider refused the request.");
+
+    return jsonFailure(
+      planArchiveFailure(archive.reason, archive.status, archive.retryable),
+    );
   }
 
-  const remaining = Math.max(0, expiresAt - Math.floor(Date.now() / 1000));
-  const headers = new Headers({
-    // The grant is what expires, so the response is cached privately only for
-    // the remainder of its lifetime and never by a shared/CDN cache.
-    "Cache-Control": `private, max-age=${remaining}`,
-    "X-Content-Type-Options": "nosniff",
-    "Content-Disposition": contentDisposition(media),
-  });
-
-  const passthrough = [
-    "content-type",
-    "content-length",
-    "content-range",
-    "accept-ranges",
-    "etag",
-    "last-modified",
-  ] as const;
-  for (const header of passthrough) {
-    const value = upstreamResponse.headers.get(header);
-    if (value) headers.set(header, value);
-  }
-
-  if (!headers.has("content-type")) {
-    headers.set("content-type", media.mime_type || "application/octet-stream");
-  }
-  // Range support is what lets the HTML5 player seek and start playing before
-  // the whole file arrives; advertise it even when the provider omitted it.
-  if (!headers.has("accept-ranges")) headers.set("accept-ranges", "bytes");
-
-  return new Response(upstreamResponse.body, {
-    status: upstreamResponse.status,
-    statusText: upstreamResponse.statusText,
-    headers,
-  });
+  // ── 3. A genuine "no copy available" answer ─────────────────────────────
+  // Reached only when Cloudinary is provably gone (recorded cleanup, or a
+  // 404/410 from the provider) and no Drive archive exists — i.e. the server
+  // confirmed the media is unavailable instead of assuming it.
+  return jsonFailure(decision.failure);
 }

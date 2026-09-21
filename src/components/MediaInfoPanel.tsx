@@ -6,6 +6,7 @@ import {
   durationLabel,
   jobTone,
   kindLabel,
+  sourceLabel,
 } from "@/lib/media-display";
 import {
   jobFor,
@@ -80,6 +81,10 @@ export default function MediaInfoPanel({
         : "Not archived",
     ],
     ["Drive job", drive?.status || "—"],
+    // Where the bytes actually come from. After a verified archive the
+    // Cloudinary original is removed on purpose, so the Drive copy is the
+    // live source and the panel must not imply the media is missing.
+    ["Served from", sourceLabel(media)],
     ["Telegram job", telegram?.status || "—"],
     ["Cleanup", cleanupLabel(media.primary_cleanup_status)],
     ["Cleanup completed", formatTimestamp(media.primary_cleanup_completed_at) ?? "—"],

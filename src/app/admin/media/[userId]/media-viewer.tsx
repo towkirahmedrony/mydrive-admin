@@ -8,7 +8,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MediaInfoPanel from "@/components/MediaInfoPanel";
 import StatusBadge from "@/components/StatusBadge";
 import { formatBytes, formatTimestamp } from "@/lib/format";
-import { durationLabel, kindLabel } from "@/lib/media-display";
+import {
+  durationLabel,
+  kindLabel,
+  servedFromDriveArchive,
+} from "@/lib/media-display";
 import {
   mediaAssetPath,
   mediaKind,
@@ -358,6 +362,52 @@ export default function MediaViewer({
         contentType.startsWith("video/") ||
         contentType.startsWith("application/octet-stream");
 
+      // The asset route answers failures with a reason code so the copy here
+      // never has to guess. Without it, an expired token, an unreachable Drive
+      // account and a genuinely deleted file would all read the same, and a
+      // healthy archived file would be reported as deleted.
+      let reason = "";
+      if (contentType.includes("application/json")) {
+        try {
+          const payload = await response.clone().json() as { reason?: unknown };
+          if (typeof payload.reason === "string") reason = payload.reason;
+        } catch {
+          reason = "";
+        }
+      }
+
+      if (reason === "file_unavailable") {
+        return {
+          title: "File not available",
+          detail:
+            "Both the working copy and its verified Google Drive archive could not be found. The file was deleted or its upload never completed.",
+          retryable: false,
+        };
+      }
+      if (reason === "archive_credential_error") {
+        return {
+          title: "Archive account needs attention",
+          detail:
+            "This file is archived in Google Drive, but the Drive account that holds it could not be authorized. Reconnect the account on the Drive page and try again.",
+          retryable: false,
+        };
+      }
+      if (reason === "archive_no_preview") {
+        return {
+          title: "No preview available",
+          detail:
+            "The archived file exists but Google Drive provides no preview image for it. The metadata below is still accurate.",
+          retryable: false,
+        };
+      }
+      if (reason === "media_not_found") {
+        return {
+          title: "Media record not found",
+          detail:
+            "This media is no longer in the database. Reload the media page and pick the file again.",
+          retryable: false,
+        };
+      }
       if (response.status === 401 || response.status === 403) {
         return {
           title: "Media link expired",
@@ -367,11 +417,21 @@ export default function MediaViewer({
         };
       }
       if (response.status === 404 || response.status === 410) {
+        // A 404 without the `file_unavailable` reason is not a deleted file:
+        // it is the archive path answering (no preview, missing record, …).
         return {
           title: "File not available",
           detail:
             "This file is no longer present in storage. It may have been deleted, or its upload never completed.",
           retryable: false,
+        };
+      }
+      if (reason === "archive_unavailable" || reason === "provider_unavailable") {
+        return {
+          title: "Storage temporarily unavailable",
+          detail:
+            "This file is stored in the Google Drive archive, which could not be read right now. Nothing was deleted — try again in a moment.",
+          retryable: true,
         };
       }
       if (response.status === 422) {
@@ -581,6 +641,13 @@ export default function MediaViewer({
                   tone={media.status === "READY" ? "success" : media.status === "FAILED" ? "danger" : "warning"}
                 />
               </span>
+              {/* The Cloudinary working copy is gone for most archived media;
+                  say plainly which store is serving the bytes. */}
+              {servedFromDriveArchive(media) && (
+                <span className="hidden sm:inline">
+                  <StatusBadge label="Drive archive" tone="success" />
+                </span>
+              )}
             </p>
           )}
         </div>

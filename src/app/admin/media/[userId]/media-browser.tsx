@@ -14,6 +14,7 @@ import {
   cleanupLabel,
   cleanupTone,
   jobTone,
+  servedFromDriveArchive,
 } from "@/lib/media-display";
 import {
   jobFor,
@@ -376,7 +377,21 @@ export default function MediaBrowser({
                       className="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500"
                     />
                   </label>
-                  {video && <span className="pointer-events-none absolute right-3 top-3 rounded-full bg-black/65 px-2 py-1 text-xs font-semibold text-white">VIDEO</span>}
+                  <div className="pointer-events-none absolute right-3 top-3 flex flex-col items-end gap-1.5">
+                    {video && (
+                      <span className="rounded-full bg-black/65 px-2 py-1 text-xs font-semibold text-white">VIDEO</span>
+                    )}
+                    {/* The Cloudinary working copy is removed after a verified
+                        archive; the tile is served from Google Drive. */}
+                    {servedFromDriveArchive(item) && (
+                      <span
+                        title="Served from the Google Drive archive"
+                        className="rounded-full bg-emerald-600/85 px-2 py-1 text-xs font-semibold text-white"
+                      >
+                        DRIVE
+                      </span>
+                    )}
+                  </div>
                   <div className="absolute inset-x-0 bottom-0 flex justify-end gap-2 bg-gradient-to-t from-black/70 to-transparent px-3 pb-3 pt-8 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
                     <button
                       type="button"

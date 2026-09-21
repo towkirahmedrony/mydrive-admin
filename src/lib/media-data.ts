@@ -15,6 +15,7 @@ import {
   type MediaListFilters,
   type MediaSort,
   type MediaStatusFilter,
+  type ReplicationJob,
 } from "@/lib/media-types";
 
 export {
@@ -77,8 +78,39 @@ const MEDIA_COLUMNS = [
   "primary_cleanup_completed_at",
   "primary_deleted_at",
   "devices(id,device_name,brand,model,android_version,device_uid,status)",
-  "replication_jobs(id,destination_type,status,last_error,attempt_count,started_at,completed_at,created_at)",
+  "replication_jobs(id,destination_type,status,last_error,attempt_count,started_at,completed_at,created_at,google_drive_file_id)",
 ].join(",");
+
+/**
+ * `google_drive_file_id` is read so the server can decide whether an archived
+ * copy exists, then stripped here: the Drive locator must never reach the
+ * browser (`media_assets` -> `replication_jobs.google_drive_file_id` is the
+ * server-side ownership relationship the asset route resolves).
+ */
+function toClientMedia(row: Record<string, unknown>): MediaAsset {
+  const jobs = Array.isArray(row.replication_jobs)
+    ? (row.replication_jobs as Array<Record<string, unknown>>)
+    : [];
+
+  const driveJob = jobs.find((job) => job.destination_type === "google_drive");
+  const driveArchived = Boolean(
+    driveJob?.status === "COMPLETED" &&
+      typeof driveJob.google_drive_file_id === "string" &&
+      (driveJob.google_drive_file_id as string).trim().length > 0,
+  );
+
+  const publicJobs: ReplicationJob[] = jobs.map((job) =>
+    Object.fromEntries(
+      Object.entries(job).filter(([key]) => key !== "google_drive_file_id"),
+    ) as ReplicationJob
+  );
+
+  return {
+    ...(row as unknown as MediaAsset),
+    replication_jobs: publicJobs,
+    drive_archived: driveArchived,
+  };
+}
 
 type Client = Awaited<ReturnType<typeof createClient>>;
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -326,7 +358,8 @@ export async function loadEmployeeMedia(
   const { data, count, error } = await query;
   if (error) return { ...empty, error: error.message };
 
-  const media = (data ?? []) as unknown as MediaAsset[];
+  const media = ((data ?? []) as unknown as Array<Record<string, unknown>>)
+    .map(toClientMedia);
   const deviceIds = Array.from(
     new Set(media.map((item) => item.device_id).filter((id): id is string => Boolean(id))),
   );
@@ -376,7 +409,15 @@ export async function ownedMediaIds(
   return data.map((row) => row.id as string);
 }
 
-/** The only fields the signed asset route needs, including the provider URLs. */
+/**
+ * The only fields the signed asset route needs, including the provider URLs and
+ * the archive relationship.
+ *
+ * `drive_archived` is resolved from the media's own completed `google_drive`
+ * replication job. The Drive file id that proves it is read here and dropped
+ * again — the route asks the `media-drive` function for bytes by `media_id`,
+ * so a Google Drive locator is never carried — or accepted — from the browser.
+ */
 export type MediaAssetSource = {
   id: string;
   owner_id: string;
@@ -384,6 +425,14 @@ export type MediaAssetSource = {
   mime_type: string | null;
   storage_url: string | null;
   thumbnail_url: string | null;
+  /** Set once the archival worker verified the Drive copy. */
+  drive_archived_at: string | null;
+  /** 'cleanup_success' means the Cloudinary original was removed on purpose. */
+  primary_cleanup_status: string | null;
+  /** Set when the Cloudinary original was actually destroyed. */
+  primary_deleted_at: string | null;
+  /** true when the Drive archive holds a verified copy of this media. */
+  drive_archived: boolean;
 };
 
 /**
@@ -403,12 +452,42 @@ export async function loadMediaForAsset(
   const supabase = await createClient();
   const { data, error } = await supabase
     .from("media_assets")
-    .select("id,owner_id,file_name,mime_type,storage_url,thumbnail_url")
+    .select(
+      "id,owner_id,file_name,mime_type,storage_url,thumbnail_url,drive_archived_at," +
+        "primary_cleanup_status,primary_deleted_at," +
+        "replication_jobs(destination_type,status,google_drive_file_id)",
+    )
     .eq("id", mediaId)
     .eq("owner_id", userId)
     .maybeSingle();
 
   if (error) return { media: null, error: error.message };
-  return { media: (data as MediaAssetSource | null) ?? null, error: null };
+  if (!data) return { media: null, error: null };
+
+  const row = data as unknown as Record<string, unknown>;
+  const jobs = Array.isArray(row.replication_jobs)
+    ? (row.replication_jobs as Array<Record<string, unknown>>)
+    : [];
+  const driveJob = jobs.find((job) => job.destination_type === "google_drive");
+
+  const media: MediaAssetSource = {
+    id: row.id as string,
+    owner_id: row.owner_id as string,
+    file_name: (row.file_name as string | null) ?? null,
+    mime_type: (row.mime_type as string | null) ?? null,
+    storage_url: (row.storage_url as string | null) ?? null,
+    thumbnail_url: (row.thumbnail_url as string | null) ?? null,
+    drive_archived_at: (row.drive_archived_at as string | null) ?? null,
+    primary_cleanup_status:
+      (row.primary_cleanup_status as string | null) ?? null,
+    primary_deleted_at: (row.primary_deleted_at as string | null) ?? null,
+    drive_archived: Boolean(
+      driveJob?.status === "COMPLETED" &&
+        typeof driveJob.google_drive_file_id === "string" &&
+        (driveJob.google_drive_file_id as string).trim().length > 0,
+    ),
+  };
+
+  return { media, error: null };
 }
 

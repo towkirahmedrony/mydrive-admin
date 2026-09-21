@@ -102,6 +102,17 @@ export type MediaAsset = {
   uploaded_at: string | null;
   deleted_at: string | null;
   drive_archived_at: string | null;
+  /**
+   * true when a COMPLETED `google_drive` replication job holds a verified Drive
+   * file id for this media.
+   *
+   * The id itself is never part of this shape or of any job sent here: the
+   * Drive locator is read server-side (`loadMediaForAsset`) and the browser
+   * only ever receives this boolean. The Cloudinary original is deleted after
+   * a verified archive, so this flag is what tells the UI that the archived
+   * copy — not Cloudinary — is the live source.
+   */
+  drive_archived: boolean;
   primary_cleanup_status: string | null;
   primary_cleanup_attempts: number | null;
   primary_cleanup_error: string | null;
