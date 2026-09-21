@@ -111,6 +111,7 @@ export default function MediaBrowser({
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
+  const [filtersOpen, setFiltersOpen] = useState(false);
 
   const view = (searchParams.get("view") === "list" ? "list" : "grid") as ViewMode;
   const q = searchParams.get("q") ?? "";
@@ -185,10 +186,35 @@ export default function MediaBrowser({
   }
 
   const selectClass = "rounded-lg border border-gray-300 bg-white px-3 py-2.5 text-sm";
+  const activeFilterCount = [
+    q,
+    kind !== "ALL" ? kind : "",
+    status !== "ALL" ? status : "",
+    archive !== "ALL" ? archive : "",
+    cleanup !== "ALL" ? cleanup : "",
+    sort !== "newest" ? sort : "",
+    from,
+    to,
+  ].filter(Boolean).length;
 
   return (
     <div className="space-y-4">
-      <section className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+      <section className="rounded-lg border border-gray-200 bg-white p-2 shadow-sm sm:rounded-xl sm:p-4">
+        <div className="flex items-center justify-between sm:hidden">
+          <span className="text-sm font-semibold text-gray-800">Media filters</span>
+          <button
+            type="button"
+            onClick={() => setFiltersOpen((open) => !open)}
+            aria-expanded={filtersOpen}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 px-2.5 py-1.5 text-xs font-medium text-gray-700"
+          >
+            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+              <path strokeLinecap="round" d="M4 6h16M7 12h10M10 18h4" />
+            </svg>
+            {activeFilterCount ? `${activeFilterCount} active` : "Filter"}
+          </button>
+        </div>
+        <div className={`${filtersOpen ? "block" : "hidden"} mt-2 sm:mt-0 sm:block`}>
         <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
           <label className="relative flex-1">
             <span className="sr-only">Search media</span>
@@ -249,6 +275,7 @@ export default function MediaBrowser({
               List
             </button>
           </div>
+        </div>
         </div>
       </section>
 
