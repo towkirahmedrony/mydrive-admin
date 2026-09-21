@@ -1,5 +1,5 @@
 export const EMPLOYEE_PAGE_SIZE = 24;
-export const MEDIA_PAGE_SIZE = 24;
+export const MEDIA_PAGE_SIZE = 100;
 
 /**
  * Lifetime of a signed media access link.

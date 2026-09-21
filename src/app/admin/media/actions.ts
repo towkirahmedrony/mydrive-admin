@@ -5,10 +5,11 @@ import { createClient } from "@/lib/supabase/server";
 import { issueMediaAccess } from "@/lib/media-access";
 import {
   isUuid,
+  loadEmployeeMedia,
   ownedMediaIds,
   requireAdminActor,
 } from "@/lib/media-data";
-import type { MediaAccessGrant } from "@/lib/media-types";
+import type { MediaAccessGrant, MediaListFilters } from "@/lib/media-types";
 
 export async function retryEmployeeMediaJobs(
   userId: string,
@@ -83,4 +84,50 @@ export async function refreshMediaAccess(
   if (!employee) return { success: false, error: "Employee not found." };
 
   return { success: true, grant: issueMediaAccess(userId) };
+}
+
+/**
+ * Fetches an additional page of media for infinite scroll.
+ *
+ * The browser calls this as the user scrolls toward the end of the gallery.
+ * Only metadata is returned — thumbnails are loaded by the browser through
+ * the signed asset route, so this action never touches provider URLs.
+ */
+export async function loadMoreMedia(
+  userId: string,
+  page: number,
+  filters: {
+    kind?: string;
+    status?: string;
+    archive?: string;
+    cleanup?: string;
+    sort?: string;
+    q?: string;
+    from?: string;
+    to?: string;
+  },
+): Promise<{
+  media: Awaited<ReturnType<typeof loadEmployeeMedia>>["media"];
+  total: number;
+  page: number;
+  pageSize: number;
+  error: string | null;
+}> {
+  if (!isUuid(userId)) {
+    return { media: [], total: 0, page, pageSize: 0, error: "Invalid employee." };
+  }
+
+  const inputFilters: MediaListFilters = {
+    kind: (filters.kind as MediaListFilters["kind"]) ?? undefined,
+    status: (filters.status as MediaListFilters["status"]) ?? undefined,
+    archive: (filters.archive as MediaListFilters["archive"]) ?? undefined,
+    cleanup: (filters.cleanup as MediaListFilters["cleanup"]) ?? undefined,
+    sort: (filters.sort as MediaListFilters["sort"]) ?? undefined,
+    search: filters.q || undefined,
+    from: filters.from || undefined,
+    to: filters.to || undefined,
+    page,
+  };
+
+  return loadEmployeeMedia(userId, inputFilters);
 }
