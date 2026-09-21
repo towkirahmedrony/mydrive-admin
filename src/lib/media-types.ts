@@ -40,6 +40,9 @@ export type EmployeeRow = {
 
 export type EmployeeFolder = EmployeeRow & {
   media_count: number;
+  photo_count: number;
+  video_count: number;
+  total_size_bytes: number;
 };
 
 export type EmployeeSummary = EmployeeRow & {

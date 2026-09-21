@@ -104,7 +104,15 @@ export default async function MediaEmployeesPage({
         <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
           {employees.map((employee) => {
             const name = employeeDisplayName(employee);
-            const used = formatBytes(employee.storage_used_bytes);
+            const used = formatBytes(employee.total_size_bytes || employee.storage_used_bytes);
+            const summaryParts: string[] = [];
+            if (employee.media_count > 0) {
+              summaryParts.push(`${employee.media_count.toLocaleString()} media`);
+            }
+            if (used && used !== "0 B") summaryParts.push(used);
+            if (employee.photo_count > 0) summaryParts.push(`${employee.photo_count} photos`);
+            if (employee.video_count > 0) summaryParts.push(`${employee.video_count} videos`);
+            const summary = summaryParts.join(" · ");
             return (
               <Link
                 key={employee.id}
@@ -126,10 +134,18 @@ export default async function MediaEmployeesPage({
                   )}
                 </div>
                 <div className="mt-5 border-t border-gray-100 pt-4">
-                  <p className="text-sm font-medium text-gray-900">
-                    {employee.media_count.toLocaleString()} media
-                  </p>
-                  <p className="mt-1 text-sm text-gray-500">{used ?? "0 B"}</p>
+                  {employee.media_count > 0 ? (
+                    <p className="flex items-center gap-1.5 text-sm text-gray-600">
+                      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 shrink-0 text-gray-400" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                        <rect x="3" y="3" width="18" height="18" rx="2" />
+                        <circle cx="8.5" cy="8.5" r="1.5" fill="currentColor" stroke="none" />
+                        <path strokeLinecap="round" d="M21 15l-5-5L5 21" />
+                      </svg>
+                      <span className="font-medium text-gray-900">{summary}</span>
+                    </p>
+                  ) : (
+                    <p className="text-sm text-gray-400 italic">No media</p>
+                  )}
                 </div>
               </Link>
             );

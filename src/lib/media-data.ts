@@ -3,6 +3,7 @@ import {
   EMPLOYEE_PAGE_SIZE,
   MEDIA_PAGE_SIZE,
   isUuid,
+  mediaKind,
   sanitizeSearch,
   type ArchiveFilter,
   type BackupSessionInfo,
@@ -12,6 +13,7 @@ import {
   type EmployeeSummary,
   type MediaAsset,
   type MediaKind,
+  type MediaKindName,
   type MediaListFilters,
   type MediaSort,
   type MediaStatusFilter,
@@ -39,6 +41,7 @@ export type {
   EmployeeSummary,
   MediaAsset,
   MediaKind,
+  MediaKindName,
   MediaListFilters,
   MediaSort,
   MediaStatusFilter,
@@ -187,6 +190,24 @@ async function countOwnedMedia(
   return count ?? 0;
 }
 
+/** Sum of file_size for a user's non-deleted media (used for folder summary). */
+async function sumOwnedMediaSize(
+  supabase: Client,
+  userId: string,
+): Promise<number> {
+  const { data } = await supabase
+    .from("media_assets")
+    .select("file_size")
+    .eq("owner_id", userId)
+    .is("deleted_at", null)
+    .neq("status", "DELETED");
+  if (!data) return 0;
+  return (data as Array<{ file_size: number | string | null }>).reduce(
+    (acc, row) => acc + Number(row.file_size ?? 0),
+    0,
+  );
+}
+
 export async function loadEmployeeFolders(input: {
   search?: string;
   page?: number;
@@ -227,10 +248,20 @@ export async function loadEmployeeFolders(input: {
 
   const profiles = (data ?? []) as EmployeeRow[];
   const counts = await Promise.all(
-    profiles.map(async (profile) => ({
-      profile,
-      media_count: await countOwnedMedia(supabase, profile.id),
-    })),
+    profiles.map(async (profile) => {
+      const [media_count, photo_count, video_count, total_size_bytes] =
+        await Promise.all([
+          countOwnedMedia(supabase, profile.id),
+          countOwnedMedia(supabase, profile.id, (q) =>
+            q.ilike("mime_type", "image/%"),
+          ),
+          countOwnedMedia(supabase, profile.id, (q) =>
+            q.ilike("mime_type", "video/%"),
+          ),
+          sumOwnedMediaSize(supabase, profile.id),
+        ]);
+      return { profile, media_count, photo_count, video_count, total_size_bytes };
+    }),
   );
 
   // A user can have duplicate profile rows (for example after an account
@@ -238,9 +269,16 @@ export async function loadEmployeeFolders(input: {
   // that owns the most media, so one person is shown only once and the link
   // still opens the profile containing that person's media.
   const grouped = new Map<string, EmployeeFolder>();
-  for (const { profile, media_count } of counts) {
+  for (const entry of counts) {
+    const { profile, media_count, photo_count, video_count, total_size_bytes } = entry;
     const identity = (profile.full_name?.trim() || profile.email?.trim() || profile.id).toLowerCase();
-    const candidate = { ...profile, media_count };
+    const candidate: EmployeeFolder = {
+      ...profile,
+      media_count,
+      photo_count,
+      video_count,
+      total_size_bytes,
+    };
     const existing = grouped.get(identity);
     if (!existing || candidate.media_count > existing.media_count) {
       grouped.set(identity, candidate);
@@ -355,6 +393,8 @@ export async function loadEmployeeMedia(
   page: number;
   pageSize: number;
   sessionsByDevice: Record<string, BackupSessionInfo>;
+  photoCount: number;
+  videoCount: number;
   error: string | null;
 }> {
   const page = Math.max(1, filters.page ?? 1);
@@ -364,6 +404,8 @@ export async function loadEmployeeMedia(
     page,
     pageSize: MEDIA_PAGE_SIZE,
     sessionsByDevice: {} as Record<string, BackupSessionInfo>,
+    photoCount: 0,
+    videoCount: 0,
     error: null as string | null,
   };
 
@@ -379,16 +421,25 @@ export async function loadEmployeeMedia(
     .select(MEDIA_COLUMNS, { count: "exact" });
   query = applyMediaFilters(query, userId, filters);
   query = applyMediaSort(query, sort);
-  query = query.range(from, to);
+  query = query.range(from, to);    const { data, count, error } = await query;
+    if (error) return { ...empty, error: error.message };
 
-  const { data, count, error } = await query;
-  if (error) return { ...empty, error: error.message };
+    const media = ((data ?? []) as unknown as Array<Record<string, unknown>>)
+      .map(toClientMedia);
 
-  const media = ((data ?? []) as unknown as Array<Record<string, unknown>>)
-    .map(toClientMedia);
-  const deviceIds = Array.from(
-    new Set(media.map((item) => item.device_id).filter((id): id is string => Boolean(id))),
-  );
+    // Derive photo/video counts from the loaded media so the gallery header
+    // can show them without extra queries.
+    let photoCount = 0;
+    let videoCount = 0;
+    for (const item of media) {
+      const kind: MediaKindName = mediaKind(item);
+      if (kind === "image") photoCount++;
+      else if (kind === "video") videoCount++;
+    }
+
+    const deviceIds = Array.from(
+      new Set(media.map((item) => item.device_id).filter((id): id is string => Boolean(id))),
+    );
 
   const sessionsByDevice: Record<string, BackupSessionInfo> = {};
   if (deviceIds.length > 0) {
@@ -412,6 +463,8 @@ export async function loadEmployeeMedia(
     page,
     pageSize: MEDIA_PAGE_SIZE,
     sessionsByDevice,
+    photoCount: photoCount ?? 0,
+    videoCount: videoCount ?? 0,
     error: null,
   };
 }

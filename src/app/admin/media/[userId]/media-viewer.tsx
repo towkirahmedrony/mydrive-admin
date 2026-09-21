@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import MediaInfoPanel from "@/components/MediaInfoPanel";
 import StatusBadge from "@/components/StatusBadge";
-import { formatBytes, formatTimestamp } from "@/lib/format";
+import { formatBytes } from "@/lib/format";
 import {
   durationLabel,
   kindLabel,
@@ -622,9 +622,9 @@ export default function MediaViewer({
 
   const transition = dragging ? "" : "transition-transform duration-150 ease-out motion-reduce:transition-none";
   const controlClass =
-    "inline-flex h-9 items-center justify-center gap-1 rounded-lg border border-white/15 bg-white/5 px-2.5 text-sm text-gray-100 transition hover:bg-white/15 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:cursor-not-allowed disabled:opacity-40";
+    "inline-flex h-8 items-center justify-center gap-1 rounded-lg border border-white/10 bg-white/[0.06] px-2.5 text-sm text-gray-100 transition hover:bg-white/10 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:cursor-not-allowed disabled:opacity-40";
   const navClass =
-    "absolute top-1/2 z-10 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full border border-white/15 bg-black/55 text-2xl leading-none text-white transition hover:bg-black/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:pointer-events-none disabled:opacity-0";
+    "absolute top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full bg-black/50 backdrop-blur-sm text-white/90 transition hover:bg-black/70 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400 disabled:pointer-events-none disabled:opacity-0";
 
   return (
     <div
@@ -638,44 +638,40 @@ export default function MediaViewer({
       }`}
     >
       {/* ------------------------------------------------------------- header */}
-      <header className="flex items-start justify-between gap-3 border-b border-white/10 px-3 py-2.5 sm:px-4">
-        <div className="min-w-0">
-          <p className="truncate text-sm font-semibold text-white">
-            {media?.file_name || "Untitled media"}
-          </p>
+      <header className="flex items-center gap-2 border-b border-white/[0.08] bg-black/60 px-3 py-2 backdrop-blur-sm sm:px-4">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <p className="truncate text-[13px] font-medium text-white/90">
+              {media?.file_name || "Untitled media"}
+            </p>
+          </div>
           {media && (
-            <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-gray-400">
+            <p className="mt-0.5 flex items-center gap-x-1.5 text-[11px] text-gray-500">
               <span>{kindLabel(kind)}</span>
               <span aria-hidden>·</span>
               <span>{formatBytes(media.file_size) ?? "—"}</span>
-              <span aria-hidden>·</span>
-              <span>{formatTimestamp(media.uploaded_at || media.created_at) ?? "—"}</span>
               {video && media.duration_ms != null && (
                 <>
                   <span aria-hidden>·</span>
                   <span>{durationLabel(media.duration_ms)}</span>
                 </>
               )}
-              <span className="hidden sm:inline">
+              <span className="ml-1 inline-flex items-center gap-1.5">
                 <StatusBadge
                   label={media.status}
                   tone={media.status === "READY" ? "success" : media.status === "FAILED" ? "danger" : "warning"}
                 />
-              </span>
-              {/* The Cloudinary working copy is gone for most archived media;
-                  say plainly which store is serving the bytes. */}
-              {servedFromDriveArchive(media) && (
-                <span className="hidden sm:inline">
+                {servedFromDriveArchive(media) && (
                   <StatusBadge label="Drive archive" tone="success" />
-                </span>
-              )}
+                )}
+              </span>
             </p>
           )}
         </div>
 
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1.5">
           <span
-            className="rounded-full bg-white/10 px-2.5 py-1 text-xs font-medium tabular-nums text-gray-100"
+            className="rounded-md bg-white/[0.08] px-2 py-0.5 text-[11px] font-medium tabular-nums text-gray-400"
             aria-live="polite"
             aria-atomic="true"
           >
@@ -699,9 +695,9 @@ export default function MediaViewer({
             onClick={requestClose}
             aria-label="Close viewer"
             title="Close (Esc)"
-            className={controlClass}
+            className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 transition hover:bg-white/10 hover:text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
           >
-            <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
               <path strokeLinecap="round" d="M6 6l12 12M18 6L6 18" />
             </svg>
           </button>
@@ -771,13 +767,15 @@ export default function MediaViewer({
             )}
 
             {loadState === "loading" && !failure && (
-              <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/40">
-                <div className="flex items-center gap-3 rounded-full bg-black/70 px-4 py-2 text-sm text-gray-100">
+              <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                <div className="flex flex-col items-center gap-3">
                   <span
-                    className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white"
+                    className="h-7 w-7 animate-spin rounded-full border-2 border-white/20 border-t-white/70"
                     aria-hidden="true"
                   />
-                  <span role="status">Loading media…</span>
+                  <span role="status" className="text-xs text-gray-500">
+                    Loading…
+                  </span>
                 </div>
               </div>
             )}
@@ -822,9 +820,11 @@ export default function MediaViewer({
               disabled={!canPrevious}
               aria-label="Previous media"
               title="Previous (←)"
-              className={`${navClass} left-2 sm:left-4`}
+              className={`${navClass} left-2 sm:left-3`}
             >
-              ‹
+              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+              </svg>
             </button>
             <button
               type="button"
@@ -832,58 +832,59 @@ export default function MediaViewer({
               disabled={!canNext}
               aria-label="Next media"
               title="Next (→)"
-              className={`${navClass} right-2 sm:right-4`}
+              className={`${navClass} right-2 sm:right-3`}
             >
-              ›
+              <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.5" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+              </svg>
             </button>
           </div>
 
           {/* ---------------------------------------------------------- footer */}
-          <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 bg-black/40 px-3 py-2 sm:px-4">
-            <div className="flex flex-wrap items-center gap-1.5">
+          <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.08] bg-black/60 px-3 py-1.5 sm:px-4">
+            <div className="flex flex-wrap items-center gap-1">
               {image ? (
                 <>
                   <button type="button" onClick={zoomOut} className={controlClass} aria-label="Zoom out" title="Zoom out (−)">
-                    −
+                    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                      <path strokeLinecap="round" d="M5 12h14" />
+                    </svg>
                   </button>
-                  <span className="w-14 text-center text-xs tabular-nums text-gray-300" aria-live="polite">
+                  <span className="w-12 text-center text-[11px] tabular-nums text-gray-400" aria-live="polite">
                     {Math.round(view.zoom * 100)}%
                   </span>
                   <button type="button" onClick={zoomIn} className={controlClass} aria-label="Zoom in" title="Zoom in (+)">
-                    +
+                    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                      <path strokeLinecap="round" d="M12 5v14M5 12h14" />
+                    </svg>
                   </button>
                   <button
                     type="button"
                     onClick={resetView}
                     aria-pressed={view.zoom === 1 && view.x === 0 && view.y === 0}
-                    className={controlClass}
+                    className="inline-flex h-8 items-center gap-1 rounded-lg px-2 text-[11px] text-gray-400 transition hover:bg-white/[0.06] hover:text-gray-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-400"
                     title="Fit the whole image on screen (F / 0)"
                   >
-                    Fit to screen
-                  </button>
-                  <button
-                    type="button"
-                    onClick={resetView}
-                    disabled={view.zoom === 1 && view.x === 0 && view.y === 0}
-                    className={controlClass}
-                    title="Reset zoom and position (0)"
-                  >
-                    Reset view
+                    <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                      <rect x="3" y="3" width="18" height="18" rx="2" />
+                      <path strokeLinecap="round" d="M9 3v18M15 3v18M3 9h18M3 15h18" />
+                    </svg>
+                    <span className="hidden sm:inline">Fit</span>
                   </button>
                 </>
               ) : video ? (
-                <span className="text-xs text-gray-400">
-                  Use the player controls for play, seek, volume and fullscreen.
+                <span className="text-[11px] text-gray-500">
+                  Player controls: play, seek, volume, fullscreen
                 </span>
               ) : (
-                <span className="text-xs text-gray-400">
-                  This file type cannot be previewed.
+                <span className="text-[11px] text-gray-500">
+                  Preview not available
                 </span>
               )}
             </div>
 
-            <span className="hidden text-xs text-gray-500 lg:inline">
-              ← → navigate · + − zoom · F fit · I information · Esc close
+            <span className="hidden text-[11px] text-gray-600 lg:inline">
+              ← → nav · + − zoom · F fit · I info · Esc close
             </span>
           </footer>
         </div>
@@ -892,10 +893,14 @@ export default function MediaViewer({
         {infoOpen && media && (
           <aside
             aria-label="Media information"
-            className="hidden w-80 shrink-0 overflow-y-auto border-l border-white/10 bg-slate-950/95 p-4 lg:block xl:w-96"
+            className="hidden w-80 shrink-0 overflow-y-auto border-l border-white/[0.08] bg-gray-950/98 p-4 lg:block xl:w-96"
           >
-            <h2 className="text-sm font-semibold text-white">Media information</h2>
-            <p className="mt-0.5 mb-3 text-xs text-gray-400">{employeeName}</p>
+            <div className="mb-3 flex items-center justify-between">
+              <div>
+                <h2 className="text-[13px] font-semibold text-white">Details</h2>
+                <p className="mt-0.5 text-[11px] text-gray-500">{employeeName}</p>
+              </div>
+            </div>
             <MediaInfoPanel
               media={media}
               employeeName={employeeName}
@@ -910,34 +915,50 @@ export default function MediaViewer({
 
       {/* -------------------------------------------------------- info: mobile */}
       {infoOpen && media && (
-        <div
-          className="fixed inset-x-0 bottom-0 z-10 max-h-[72vh] overflow-y-auto rounded-t-2xl border-t border-white/10 bg-slate-950/98 p-4 pb-6 shadow-2xl lg:hidden"
-          role="region"
-          aria-label="Media information"
-        >
-          <div className="mb-2 flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h2 className="text-sm font-semibold text-white">Media information</h2>
-              <p className="truncate text-xs text-gray-400">{employeeName}</p>
-            </div>
-            <button
-              type="button"
-              onClick={() => setInfoOpen(false)}
-              aria-label="Hide media information"
-              className={controlClass}
-            >
-              ✕
-            </button>
-          </div>
-          <MediaInfoPanel
-            media={media}
-            employeeName={employeeName}
-            employeeId={employeeId}
-            designation={designation}
-            session={session}
-            tone="dark"
+        <>
+          {/* Backdrop */}
+          <div
+            className="fixed inset-0 z-10 bg-black/50 backdrop-blur-sm lg:hidden"
+            onClick={() => setInfoOpen(false)}
+            aria-hidden="true"
           />
-        </div>
+          <div
+            className="fixed inset-x-0 bottom-0 z-20 max-h-[75vh] overflow-y-auto rounded-t-2xl border-t border-white/[0.1] bg-gray-950 shadow-2xl transition-transform duration-200 lg:hidden"
+            role="region"
+            aria-label="Media information"
+          >
+            {/* Drag handle */}
+            <div className="flex justify-center pt-2.5 pb-1">
+              <div className="h-1 w-8 rounded-full bg-white/20" />
+            </div>
+            <div className="px-4 pb-6">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <h2 className="text-[13px] font-semibold text-white">Details</h2>
+                  <p className="mt-0.5 text-[11px] text-gray-500">{employeeName}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setInfoOpen(false)}
+                  aria-label="Hide media information"
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 transition hover:bg-white/10 hover:text-white"
+                >
+                  <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                    <path strokeLinecap="round" d="M6 6l12 12M18 6L6 18" />
+                  </svg>
+                </button>
+              </div>
+              <MediaInfoPanel
+                media={media}
+                employeeName={employeeName}
+                employeeId={employeeId}
+                designation={designation}
+                session={session}
+                tone="dark"
+              />
+            </div>
+          </div>
+        </>
       )}
     </div>
   );
