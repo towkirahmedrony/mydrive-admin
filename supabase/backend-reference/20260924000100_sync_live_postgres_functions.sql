@@ -367,6 +367,10 @@ END;
 $function$;
 
 -- Functions present in repository SQL but absent from the live database.
+-- The older worker migration used integer for p_upload_chunk, which would
+-- create a second overload on a fresh deployment; live canonical uses bigint.
+DROP FUNCTION IF EXISTS public.complete_drive_job(uuid, text, text, uuid, uuid, text, timestamptz, text, integer, integer);
+
 CREATE OR REPLACE FUNCTION public.cleanup_expired_oauth_states()
 RETURNS void
 LANGUAGE plpgsql
