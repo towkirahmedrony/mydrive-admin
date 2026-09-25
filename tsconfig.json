@@ -36,6 +36,8 @@
   ],
   "exclude": [
     "node_modules",
-    "supabase"
+    "supabase",
+    "tests/drive-migration-verify.test.ts",
+    "tests/drive-migration-worker-safety.test.ts"
   ]
 }

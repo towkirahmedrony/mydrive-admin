@@ -1,0 +1,25 @@
+{
+  "//": "Deno-targeted Edge Functions + their tests. The app tsconfig excludes",
+  "//2": "`supabase` and targets ES2017, so typechecking these files under it",
+  "//3": "would report false errors (ES2020 BigInt literals, DOM BodyInit).",
+  "compilerOptions": {
+    "lib": ["es2022", "dom", "dom.iterable"],
+    "target": "ES2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "isolatedModules": true
+  },
+  "include": [
+    "supabase/functions/types.d.ts",
+    "supabase/functions/**/*.ts",
+    "tests/drive-migration-verify.test.ts",
+    "tests/drive-migration-worker-safety.test.ts",
+    "tests/drive-migration-schema.test.ts"
+  ],
+  "exclude": ["node_modules"]
+}

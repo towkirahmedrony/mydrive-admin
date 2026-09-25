@@ -1,5 +1,20 @@
 import { corsHeaders, handleCors } from "../_shared/cors.ts";
-import { getSupabaseAdmin } from "../_shared/auth.ts";
+import { getSupabaseAdmin, getSupabaseAuth } from "../_shared/auth.ts";
+import {
+  CALLER_AUTH_REQUIRED_MESSAGE,
+  decideAdminAuthorization,
+  decideGooglePermissionId,
+  decideRefreshTokenHandling,
+  decideStateAuthorization,
+  patchTouchesProtectedField,
+  PERMISSION_ID_CONFLICT_MESSAGE,
+  permissionIdNeedsWrite,
+  planIdentityPatch,
+  planReconnectPatch,
+  REFRESH_TOKEN_REQUIRED_MESSAGE,
+  type ReconnectAccountState,
+  type StateConsumption,
+} from "../_shared/oauth-callback-policy.ts";
 
 /**
  * google-oauth-callback — completes the admin Google Drive OAuth connection.
@@ -12,6 +27,14 @@ import { getSupabaseAdmin } from "../_shared/auth.ts";
  *     -> worker_lookup_drive_refresh_token() -> drive-replicate
  *
  * Security:
+ *   - CALLER BINDING: the HTTP caller must present a valid Supabase session and
+ *     must be the SAME user the OAuth state was minted for. Possession of a
+ *     `state` value alone never authorizes binding an account. A
+ *     caller/state mismatch is refused with the same response as an unknown
+ *     state, so the endpoint never discloses who a state belongs to.
+ *   - the caller is authenticated and the state is authorized BEFORE the Google
+ *     authorization code is exchanged, and before any state is consumed by an
+ *     unauthenticated request.
  *   - the OAuth state is single-use: it is atomically deleted only when it is
  *     unexpired, so it cannot be replayed or raced
  *   - the admin role of the state owner is re-checked server-side before any
@@ -26,6 +49,24 @@ import { getSupabaseAdmin } from "../_shared/auth.ts";
  *   POST /functions/v1/google-oauth-callback
  *   Body: { "code": "...", "state": "..." }
  *   Returns: { "success": true, "email": "..." } or { "error": "..." }
+ *
+ * Deferred — deliberately NOT implemented in this change:
+ *   - MIGRATION GUARD. `drive_accounts` has no migration/provenance column yet,
+ *     so re-authorization cannot currently be blocked for an account that is
+ *     being retired. When the retirement feature lands it MUST add an
+ *     authoritative guard (e.g. `drive_accounts.retiring_migration_id`) and
+ *     this callback MUST refuse to restore `status = 'active'` while that guard
+ *     is set — otherwise a re-auth could silently return a retiring source
+ *     account to routing eligibility. `planReconnectPatch()` in
+ *     `_shared/oauth-callback-policy.ts` is the single place that decision is
+ *     made, so the guard belongs there.
+ *   - (implemented) STABLE GOOGLE IDENTITY. `about.user.permissionId` is
+ *     requested from the same Drive `about` call that already supplies the
+ *     email and quota, and is persisted to `drive_accounts.google_permission_id`
+ *     (nullable, opaque). `google_email` remains the OAuth matching key and is
+ *     unchanged for display/backward compatibility. The stable identity exists
+ *     to detect the case the email cannot — the same address now belonging to a
+ *     different Google account — which is REFUSED rather than silently rebound.
  */
 
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -232,6 +273,32 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    // ── 0. Authenticate the caller ──────────────────────────────────────────
+    // Possession of a `state` value must never be sufficient to bind a Google
+    // account. The admin panel invokes this function from the authenticated
+    // browser client, so an Authorization header is expected. The caller is
+    // resolved BEFORE the state is consumed, so an unauthenticated request
+    // cannot burn a legitimate admin's pending state.
+    let callerUserId: string | null = null;
+    try {
+      const auth = await getSupabaseAuth(req);
+      callerUserId = auth.user.id;
+      log("info", OPERATION, {
+        event: "caller_authentication",
+        result: "success",
+        callerUserId,
+      });
+    } catch (authError) {
+      // The error text from the auth helper never contains the token itself.
+      log("error", OPERATION, {
+        event: "caller_authentication",
+        result: "failure",
+        errorName: (authError as Error)?.name ?? null,
+        errorMessage: (authError as Error)?.message ?? null,
+      });
+      return json({ error: CALLER_AUTH_REQUIRED_MESSAGE }, 401);
+    }
+
     // ── 1. Consume the single-use state atomically ──────────────────────────
     // The DELETE only matches an unexpired row, so exactly one concurrent
     // request can win and an already-used/expired state matches nothing.
@@ -260,6 +327,9 @@ Deno.serve(async (req: Request) => {
       consumedCount: consumed?.length ?? 0,
     });
 
+    // Classify the consumption outcome; authorization is decided from it below.
+    let consumption: StateConsumption;
+
     if (!consumed || consumed.length === 0) {
       // Distinguish an expired-but-present state (clean it up) from an
       // unknown/forged/reused one, without leaking any other detail.
@@ -277,29 +347,59 @@ Deno.serve(async (req: Request) => {
       });
 
       if (stale) {
+        // Expired rows are cleaned up here; the 10-minute window is unchanged.
         await admin.from("oauth_states").delete().eq("state", state);
         log("error", OPERATION, {
           event: "oauth_state_validation",
           result: "expired",
           stateDeleted: true,
         });
-        return json(
-          { error: "OAuth session expired. Please start the connection again." },
-          400,
-        );
+        consumption = { kind: "expired" };
+      } else {
+        log("error", OPERATION, {
+          event: "oauth_state_validation",
+          result: "invalid",
+        });
+        consumption = { kind: "invalid" };
       }
-
-      log("error", OPERATION, {
-        event: "oauth_state_validation",
-        result: "invalid",
-      });
-      return json(
-        { error: "Invalid OAuth state. Please start the connection again." },
-        400,
-      );
+    } else {
+      consumption = {
+        kind: "consumed",
+        userId: (consumed[0] as { user_id: string | null }).user_id ?? null,
+      };
     }
 
-    userId = (consumed[0] as { user_id: string }).user_id;
+    // ── 1b. Authorize the CALLER against the state owner ────────────────────
+    // The state proves an administrator STARTED this flow; it does not prove
+    // who is FINISHING it. Without this check, anyone who obtained a live state
+    // could bind an arbitrary Google account into the archive pool. Both
+    // refusals happen before the authorization code is exchanged.
+    const stateRejection = decideStateAuthorization({
+      callerUserId,
+      consumption,
+    });
+
+    if (stateRejection) {
+      log("error", OPERATION, {
+        event: "oauth_state_authorization",
+        result: "failure",
+        reason: stateRejection.reason,
+        // Logged for triage only; the response never discloses ownership.
+        callerUserId,
+        stateOwnerUserId: consumption.kind === "consumed"
+          ? consumption.userId
+          : null,
+        statePresent: consumption.kind !== "invalid",
+      });
+      return json({ error: stateRejection.error }, stateRejection.status);
+    }
+
+    if (consumption.kind !== "consumed") {
+      // Unreachable: every non-consumed outcome rejects above.
+      throw new Error("OAuth state authorized without a consumed state");
+    }
+
+    userId = consumption.userId;
 
     log("info", OPERATION, {
       event: "oauth_state_validation",
@@ -326,18 +426,17 @@ Deno.serve(async (req: Request) => {
       throw new Error(`Admin re-check failed: ${profileError.message}`);
     }
 
-    const isAdmin = (profile as { role?: string } | null)?.role === "admin";
-    log(isAdmin ? "info" : "error", OPERATION, {
+    const adminRejection = decideAdminAuthorization(
+      (profile as { role?: string } | null)?.role,
+    );
+    log(adminRejection ? "error" : "info", OPERATION, {
       event: "admin_verification",
-      result: isAdmin ? "success" : "failure",
-      isAdmin,
+      result: adminRejection ? "failure" : "success",
+      isAdmin: !adminRejection,
       userId,
     });
-    if (!isAdmin) {
-      return json(
-        { error: "Administrator privileges are required to connect a Drive account." },
-        403,
-      );
+    if (adminRejection) {
+      return json({ error: adminRejection.error }, adminRejection.status);
     }
 
     // ── 3. Exchange the authorization code server-side ─────────────────────
@@ -413,10 +512,13 @@ Deno.serve(async (req: Request) => {
     // ── 4. Identify the Google account using the Drive API only ────────────
     // `about.get` accepts the drive.file scope, so no extra OAuth scope is
     // needed to learn which account was just connected.
+    // `permissionId` is the stable Google account identity (Drive's `User`
+    // resource). It is requested from this SAME call — no extra Google request
+    // and no scope change — alongside the existing identity and quota fields.
     const aboutUrl = new URL(DRIVE_ABOUT_URL);
     aboutUrl.searchParams.set(
       "fields",
-      "user(emailAddress,displayName),storageQuota(limit,usage)",
+      "user(permissionId,emailAddress,displayName),storageQuota(limit,usage)",
     );
 
     log("info", OPERATION, {
@@ -446,7 +548,11 @@ Deno.serve(async (req: Request) => {
     }
 
     const about = await aboutResponse.json() as {
-      user?: { emailAddress?: string; displayName?: string };
+      user?: {
+        permissionId?: string;
+        emailAddress?: string;
+        displayName?: string;
+      };
       storageQuota?: {
         limit?: string | null;
         usage?: string | null;
@@ -454,6 +560,8 @@ Deno.serve(async (req: Request) => {
     };
     const email = about.user?.emailAddress?.trim() ?? "";
     const displayName = about.user?.displayName?.trim() ?? "";
+    // Stable Google identity. Opaque; may legitimately be absent.
+    const googlePermissionId = about.user?.permissionId?.trim() ?? "";
     const storageLimit = normalizeGoogleByteCount(about.storageQuota?.limit);
     const storageUsage = normalizeGoogleByteCount(about.storageQuota?.usage);
     const storageAvailable = storageLimit !== null && storageUsage !== null
@@ -485,12 +593,16 @@ Deno.serve(async (req: Request) => {
       userId,
       httpStatus: aboutResponse.status,
       email,
+      // Opaque stable identity; safe to log, never returned to the client.
+      googlePermissionId: googlePermissionId || null,
     });
 
     // ── 5. Find an existing account (reconnect, never duplicate) ───────────
     const { data: existing, error: existingError } = await admin
       .from("drive_accounts")
-      .select("id, status, enabled, connection_status, health_status, refresh_token_secret_id")
+      .select(
+        "id, status, enabled, connection_status, health_status, refresh_token_secret_id, google_permission_id",
+      )
       .eq("google_email", email)
       .maybeSingle();
 
@@ -514,6 +626,7 @@ Deno.serve(async (req: Request) => {
       connection_status: string | null;
       health_status: string | null;
       refresh_token_secret_id: string | null;
+      google_permission_id: string | null;
     } | null;
 
     const existingHasSecret = Boolean(existingRow?.refresh_token_secret_id);
@@ -530,24 +643,65 @@ Deno.serve(async (req: Request) => {
       branch: existingRow ? "reconnect" : "new_account",
     });
 
+    // ── 5b. Reconcile the stable Google identity ────────────────────────────
+    // `google_email` remains the matching key. `google_permission_id` exists to
+    // catch what the email cannot: the same address now belonging to a
+    // DIFFERENT Google account. Re-pointing an existing row at a different
+    // Google account would silently hand one party's media archive to another,
+    // so that case is refused rather than resolved.
+    //
+    // No write has happened at this point, so a conflict aborts with no side
+    // effects — the stored credential, Vault secret and account row are intact.
+    const permissionDecision = decideGooglePermissionId(
+      existingRow?.google_permission_id ?? null,
+      googlePermissionId,
+    );
+
+    log(permissionDecision.action === "conflict" ? "error" : "info", OPERATION, {
+      event: "google_identity_reconciliation",
+      result: permissionDecision.action === "conflict" ? "failure" : "success",
+      userId,
+      email,
+      action: permissionDecision.action,
+      accountId: existingRow?.id ?? null,
+      existingPermissionId: existingRow?.google_permission_id ?? null,
+      incomingPermissionId: googlePermissionId || null,
+    });
+
+    if (permissionDecision.action === "conflict") {
+      return json({ error: PERMISSION_ID_CONFLICT_MESSAGE }, 409);
+    }
+
+    /** True when this run should stamp `google_permission_id`. */
+    const shouldStampIdentity = permissionIdNeedsWrite(permissionDecision);
+
     // A brand-new account (or one without a credential) is useless without a
-    // refresh token. Fail with an actionable message instead of storing nothing.
-    if (!refreshToken && !existingHasSecret) {
-      log("error", OPERATION, {
-        event: "refresh_token_check",
-        result: "failure",
-        userId,
-        email,
-        reason: "missing_refresh_token_for_new_account",
-      });
-      return json(
-        {
-          error:
-            "Google did not return a refresh token. Remove this app's access at " +
-            "https://myaccount.google.com/permissions and try connecting again.",
-        },
-        400,
-      );
+    // refresh token. An account that ALREADY holds a credential keeps it:
+    // Google omits `refresh_token` whenever the account previously authorized
+    // the app, and that is a successful re-authorization, not a failure — so an
+    // otherwise valid credential must NOT be left in `reauth_required` (D5-a).
+    const refreshDecision = decideRefreshTokenHandling(
+      refreshToken,
+      existingHasSecret,
+    );
+
+    log(refreshDecision.reject ? "error" : "info", OPERATION, {
+      event: "refresh_token_check",
+      result: refreshDecision.reject ? "failure" : "success",
+      userId,
+      email,
+      newRefreshTokenReturned: Boolean(refreshToken),
+      existingHasSecret,
+      action: refreshDecision.store
+        ? "store_new_token"
+        : (refreshDecision.reject ? "reject" : "preserve_existing_secret"),
+      ...(refreshDecision.reject
+        ? { reason: "missing_refresh_token_for_new_account" }
+        : {}),
+    });
+
+    if (refreshDecision.reject) {
+      return json({ error: REFRESH_TOKEN_REQUIRED_MESSAGE }, 400);
     }
 
     const now = new Date().toISOString();
@@ -559,26 +713,30 @@ Deno.serve(async (req: Request) => {
       // second account. Restore connection/health from this proven Drive API
       // call even when Google omits a new refresh token, so last_error is not
       // left behind after a successful re-authorization.
-      const patch: Record<string, unknown> = {
-        updated_at: now,
-        connection_status: "connected",
-        last_error: null,
-        last_error_at: null,
-        last_health_check_at: now,
+      const reconnectAccount: ReconnectAccountState = {
+        status: existingRow.status,
+        enabled: existingRow.enabled,
+        health_status: existingRow.health_status,
       };
-      const disabled = existingRow.enabled === false ||
-        existingRow.status === "disabled";
-      if (!disabled &&
-        (existingRow.status === "reauth_required" ||
-          existingRow.status === "error")) {
-        patch.status = "active";
-      }
-      if (
-        existingRow.health_status === "unhealthy" ||
-        existingRow.health_status === "unknown" ||
-        existingRow.health_status === "degraded"
-      ) {
-        patch.health_status = "healthy";
+      const patch = planReconnectPatch(reconnectAccount, now);
+
+      // Guard: re-authorization restores credentials and health, but must never
+      // disturb account identity, admin-controlled routing/capacity state, or
+      // the stored secret reference. A migration feature will add its own
+      // guard on top of this (see the deferred note in the handler docs).
+      if (patchTouchesProtectedField(patch)) {
+        log("error", OPERATION, {
+          event: "drive_account_update",
+          result: "failure",
+          userId,
+          accountId: existingRow.id,
+          errorName: "ProtectedFieldGuard",
+          errorMessage:
+            "Refusing to reconnect with a patch that touches protected fields",
+        });
+        throw new Error(
+          "Refusing to reconnect with a patch that touches protected fields",
+        );
       }
 
       const { error: updateError } = await admin
@@ -672,6 +830,39 @@ Deno.serve(async (req: Request) => {
           accountId,
         });
       }
+    }
+
+    // ── 5c. Stamp the stable Google identity ────────────────────────────────
+    // One narrow write to exactly one column, applied identically on the
+    // reconnect and new-account paths. It is deliberately NOT part of the
+    // lifecycle patch: knowing the stable identity must not be able to
+    // influence health, connection, status or routing, and an account is NOT
+    // marked healthy merely because this field became known.
+    //
+    // `updated_at` is maintained by the existing `set_updated_at` trigger.
+    //
+    // Failure here is logged but non-fatal: the account is fully usable without
+    // the identity, and the next successful OAuth event re-attempts the stamp
+    // (`decideGooglePermissionId` returns `set` for any row with no value).
+    // A transient write failure must not block connecting a Drive account.
+    if (shouldStampIdentity) {
+      const { error: identityError } = await admin
+        .from("drive_accounts")
+        .update(planIdentityPatch(googlePermissionId))
+        .eq("id", accountId)
+        // Only fill an empty slot, so a concurrent callback cannot be clobbered
+        // and the write stays idempotent.
+        .is("google_permission_id", null);
+
+      log(identityError ? "error" : "info", OPERATION, {
+        event: "google_identity_store",
+        result: identityError ? "failure" : "success",
+        userId,
+        email,
+        accountId,
+        googlePermissionId,
+        ...(identityError ? dbErrorFields(identityError) : {}),
+      });
     }
 
     // ── 6. Store the refresh token through the authoritative Vault RPC ─────

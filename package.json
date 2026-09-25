@@ -6,7 +6,15 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "test:oauth-callback": "node --test tests/oauth-callback-policy.test.ts",
+    "test:drive-migration-schema": "node --experimental-strip-types --import ./tests/register.mjs --test tests/drive-migration-schema.test.ts",
+    "typecheck": "tsc --noEmit",
+    "test:drive-migration-verify": "node --experimental-strip-types --test tests/drive-migration-verify.test.ts",
+    "test:drive-migration-worker-safety": "node --experimental-strip-types --test tests/drive-migration-worker-safety.test.ts",
+    "test:drive-migration": "node --experimental-strip-types --test tests/drive-migration-verify.test.ts tests/drive-migration-worker-safety.test.ts tests/drive-migration-source-delete-safety.test.ts tests/drive-migration-schema.test.ts",
+    "typecheck:functions": "tsc --noEmit -p tsconfig.functions.json",
+    "test:drive-migration-source-delete-safety": "node --experimental-strip-types --test tests/drive-migration-source-delete-safety.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.5.2",
