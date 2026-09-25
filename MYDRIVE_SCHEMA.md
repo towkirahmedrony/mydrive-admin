@@ -273,6 +273,90 @@ All `public` schema tables have Row Level Security (RLS) enabled.
 
 ---
 
+### device_accessibility_status
+Current accessibility monitoring state; exactly one row per registered device via a unique `device_id` constraint.
+
+| Column | Type | Constraints |
+|---|---|---|
+| id | uuid | PK, default gen_random_uuid() |
+| device_id | uuid | NOT NULL, unique, FK → devices.id, cascade delete |
+| user_id | uuid | NOT NULL, FK → profiles.id, cascade delete |
+| is_enabled | boolean | NOT NULL, default false |
+| service_connected | boolean | NOT NULL, default false |
+| last_connected_at | timestamptz | nullable |
+| last_disconnected_at | timestamptz | nullable |
+| last_event_at | timestamptz | nullable |
+| last_heartbeat_at | timestamptz | nullable |
+| accessibility_api_level | integer | nullable |
+| service_version | text | nullable |
+| created_at | timestamptz | default now() |
+| updated_at | timestamptz | default now(), maintained by `set_updated_at()` |
+
+### device_accessibility_events
+Selected, privacy-filtered events only. The Android event processor filters event types and debounces repeated high-frequency events before upload. Password-field text is never persisted, and the database enforces `NOT is_password_field OR event_text IS NULL`.
+
+| Column | Type | Constraints |
+|---|---|---|
+| id | uuid | PK, default gen_random_uuid() |
+| device_id | uuid | NOT NULL, FK → devices.id, cascade delete |
+| user_id | uuid | NOT NULL, FK → profiles.id, cascade delete |
+| event_type | text | NOT NULL |
+| package_name | text | nullable |
+| activity_name | text | nullable |
+| event_time | timestamptz | NOT NULL |
+| window_id | integer | nullable |
+| window_title | text | nullable; only when safely exposed |
+| event_text | text | nullable; never stored for password fields |
+| content_description | text | nullable; only when appropriate |
+| class_name | text | nullable |
+| is_password_field | boolean | NOT NULL, default false |
+| is_editable | boolean | nullable |
+| is_clickable | boolean | nullable |
+| is_scrollable | boolean | nullable |
+| event_metadata | jsonb | nullable |
+| created_at | timestamptz | default now() |
+
+Indexes support recent per-device reads and retention cleanup. Events are append-only for authenticated clients; only admins may delete them.
+
+### device_accessibility_sessions
+Summarized foreground app/activity sessions; `duration_ms` is populated only when a reliable end event closes the session.
+
+| Column | Type | Constraints |
+|---|---|---|
+| id | uuid | PK, default gen_random_uuid() |
+| device_id | uuid | NOT NULL, FK → devices.id, cascade delete |
+| user_id | uuid | NOT NULL, FK → profiles.id, cascade delete |
+| package_name | text | NOT NULL |
+| activity_name | text | nullable |
+| started_at | timestamptz | NOT NULL |
+| ended_at | timestamptz | nullable |
+| duration_ms | bigint | nullable, check ≥ 0 |
+| start_event_id | uuid | nullable, FK → device_accessibility_events.id, set null on delete |
+| end_event_id | uuid | nullable, FK → device_accessibility_events.id, set null on delete |
+| created_at | timestamptz | default now() |
+
+A partial unique index permits at most one open session (`ended_at IS NULL`) per device.
+
+### device_monitoring_settings
+Per-device collection switches with privacy-preserving defaults; `retention_days` defaults to 14 and is constrained to 1–365.
+
+| Column | Type | Constraints |
+|---|---|---|
+| id | uuid | PK, default gen_random_uuid() |
+| device_id | uuid | NOT NULL, unique, FK → devices.id, cascade delete |
+| user_id | uuid | NOT NULL, FK → profiles.id, cascade delete |
+| accessibility_monitoring_enabled | boolean | NOT NULL, default false |
+| event_collection_enabled | boolean | NOT NULL, default false |
+| collect_window_events | boolean | NOT NULL, default false |
+| collect_interaction_events | boolean | NOT NULL, default false |
+| collect_text_events | boolean | NOT NULL, default false |
+| collect_notification_events | boolean | NOT NULL, default false |
+| retention_days | integer | NOT NULL, default 14, check 1–365 |
+| created_at | timestamptz | default now() |
+| updated_at | timestamptz | default now(), maintained by `set_updated_at()` |
+
+All four tables have RLS. Owners can access their own device rows and admins can manage/read across devices. `purge_expired_accessibility_data()` removes expired events and sessions using each device's retention setting and is executable only by `service_role`.
+
 ## Views
 
 ### device_storage_usage
@@ -320,6 +404,7 @@ All `public` schema tables have Row Level Security (RLS) enabled.
 | `release_drive_quota` | p_drive_account_id uuid, p_bytes bigint | void | DEFINER |
 | `reserve_drive_account` | p_required_bytes bigint, p_exclude_account_ids uuid[], p_safety_margin_bytes bigint | drive_accounts | DEFINER |
 | `select_drive_account` | p_required_bytes bigint, p_exclude_account_ids uuid[], p_safety_margin_bytes bigint | drive_accounts | DEFINER |
+| `purge_expired_accessibility_data` | — | integer | DEFINER — service_role only; per-device retention cleanup |
 | `set_updated_at` | — (trigger) | trigger | INVOKER |
 | `sync_profile_storage_used` | — (trigger) | trigger | DEFINER — EXECUTE revoked from `anon`/`authenticated` (trigger-only, not exposed via REST) |
 | `trigger_drive_worker` | — | bigint | DEFINER |
