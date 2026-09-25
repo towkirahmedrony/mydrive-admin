@@ -4,6 +4,14 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { createClient } from "@/lib/supabase/client";
 import ConnectGoogleDriveButton from "@/components/ConnectGoogleDriveButton";
+import {
+  accountHasVisibleError,
+  accountNeedsReauth,
+  humanizeDriveStatus,
+  isAccountEnabled,
+  summarizeDriveAccount,
+  summaryBadgeClass,
+} from "@/lib/drive-account-state";
 
 /**
  * Edge Function that owns every Drive account read/write for the admin panel.
@@ -104,8 +112,7 @@ function formatTimestamp(value: string | null | undefined): string | null {
 }
 
 function humanize(value: string | null | undefined): string {
-  if (!value) return "unknown";
-  return value.replace(/_/g, " ");
+  return humanizeDriveStatus(value);
 }
 
 function getStatusColor(status: string | null): string {
@@ -165,10 +172,11 @@ export default function DriveAccountCard({
   routingAvailable = true,
 }: DriveAccountCardProps) {
   const [pending, setPending] = useState<
-    "enable" | "refresh" | "priority" | null
+    "enable" | "refresh" | "priority" | "disconnect" | null
   >(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const [priorityInput, setPriorityInput] = useState<string>(
     account.priority === null || account.priority === undefined
       ? "0"
@@ -307,6 +315,37 @@ export default function DriveAccountCard({
     }
   };
 
+  const handleDisconnect = async () => {
+    setPending("disconnect");
+    setError(null);
+    setNotice(null);
+    try {
+      const result = await invokeDriveAdmin({
+        action: "set_enabled",
+        id: account.id,
+        enabled: false,
+      });
+
+      if (!result || result.success === false) {
+        setError(
+          result?.error ??
+            "Failed to disconnect the account. Please try again."
+        );
+        return;
+      }
+
+      setConfirmDisconnect(false);
+      setNotice(
+        "Account disconnected from upload routing. Media, Drive files, Cloudinary objects and job history were not deleted."
+      );
+      router.refresh();
+    } catch (err) {
+      setError((err as Error)?.message ?? "An unexpected error occurred.");
+    } finally {
+      setPending(null);
+    }
+  };
+
   const limit = account.storage_limit_bytes;
   const used = account.storage_used_bytes;
   const free =
@@ -326,10 +365,10 @@ export default function DriveAccountCard({
   const lastQuotaCheck = formatTimestamp(account.last_quota_check_at);
   const lastErrorAt = formatTimestamp(account.last_error_at);
 
-  const isEnabled = account.enabled !== false && account.status !== "disabled";
-  const needsReconnect =
-    account.connection_status === "reauth_required" ||
-    account.status === "reauth_required";
+  const isEnabled = isAccountEnabled(account);
+  const needsReauth = accountNeedsReauth(account);
+  const showLastError = accountHasVisibleError(account);
+  const summary = summarizeDriveAccount(account);
 
   const displayName = account.display_name ?? account.name ?? "Unnamed account";
 
@@ -377,13 +416,16 @@ export default function DriveAccountCard({
               </p>
             </div>
           </div>
-          <span className={`${badgeBase} ${getStatusColor(account.status)}`}>
-            {humanize(account.status)}
+          <span className={`${badgeBase} ${summaryBadgeClass(summary.key)}`}>
+            {summary.label}
           </span>
         </div>
 
-        {/* Badges: enabled/disabled, connection, health, eligibility */}
+        {/* Badges: backend status, connection, health, eligibility */}
         <div className="mt-4 flex flex-wrap gap-2">
+          <span className={`${badgeBase} ${getStatusColor(account.status)}`}>
+            Status: {humanize(account.status)}
+          </span>
           <span
             className={`${badgeBase} ${
               isEnabled
@@ -493,7 +535,7 @@ export default function DriveAccountCard({
           )}
         </div>
 
-        {account.last_error && (
+        {showLastError && account.last_error && (
           <div className="mt-4 bg-red-50 border border-red-200 text-red-700 px-3 py-2 rounded text-xs">
             <div className="font-medium">Last error</div>
             <div className="mt-0.5 break-words">{account.last_error}</div>
@@ -501,13 +543,24 @@ export default function DriveAccountCard({
           </div>
         )}
 
-        {needsReconnect && (
+        {needsReauth && (
           <div className="mt-4 border border-orange-200 bg-orange-50 rounded p-3">
-            <p className="text-sm text-orange-800 mb-2">
-              This account&apos;s Google authorization has expired. Reconnect it
-              to restore uploads.
+            <p className="text-sm font-medium text-orange-900">
+              Re-authentication required
             </p>
-            <ConnectGoogleDriveButton />
+            <p className="text-sm text-orange-800 mt-1 mb-3">
+              This account cannot be used for new uploads until Google
+              authorization is completed again
+              {account.google_email ? ` for ${account.google_email}` : ""}.
+              Re-authenticate updates this existing account; it does not create
+              a second Drive account.
+            </p>
+            <ConnectGoogleDriveButton
+              mode="reauthenticate"
+              googleEmail={account.google_email}
+              compact
+              disabled={isBusy}
+            />
           </div>
         )}
       </div>
@@ -538,6 +591,15 @@ export default function DriveAccountCard({
             {pending === "refresh" ? "Refreshing..." : "Refresh health / quota"}
           </button>
 
+          {!needsReauth && (
+            <ConnectGoogleDriveButton
+              mode="reauthenticate"
+              googleEmail={account.google_email}
+              variant="link"
+              disabled={isBusy}
+            />
+          )}
+
           <form
             onSubmit={handlePrioritySubmit}
             className="flex items-center gap-2"
@@ -567,10 +629,57 @@ export default function DriveAccountCard({
           </form>
         </div>
 
+        {isEnabled && !confirmDisconnect && (
+          <button
+            type="button"
+            onClick={() => setConfirmDisconnect(true)}
+            disabled={isBusy}
+            className="text-sm text-red-600 hover:text-red-800 disabled:opacity-50 transition-colors"
+          >
+            Disconnect
+          </button>
+        )}
+
+        {confirmDisconnect && (
+          <div className="border border-red-200 bg-red-50 rounded p-3 space-y-2">
+            <p className="text-sm font-medium text-red-900">
+              Disconnect this Drive account?
+            </p>
+            <p className="text-xs text-red-800">
+              This disables the account and removes it from upload routing. It
+              does not delete media assets, replication jobs, Google Drive
+              files, Cloudinary media, or archive metadata. Active jobs keep
+              their history; the existing router/failover will skip this
+              account until it is enabled again.
+            </p>
+            <div className="flex flex-wrap gap-3">
+              <button
+                type="button"
+                onClick={handleDisconnect}
+                disabled={isBusy}
+                className="text-sm font-medium text-white bg-red-600 hover:bg-red-700 px-3 py-1.5 rounded disabled:opacity-50"
+              >
+                {pending === "disconnect"
+                  ? "Disconnecting..."
+                  : "Confirm disconnect"}
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmDisconnect(false)}
+                disabled={isBusy}
+                className="text-sm text-gray-700 hover:text-gray-900 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
         <p className="text-xs text-gray-500">
-          Disabling removes this account from upload routing. Nothing is deleted
-          — already-archived files, folder mappings and job history are always
-          kept.
+          Disconnect/Disable only removes this account from upload routing.
+          Nothing is deleted — already-archived files, folder mappings and job
+          history are always kept. Use Connect Google Drive to add a different
+          Google account.
         </p>
       </div>
     </div>

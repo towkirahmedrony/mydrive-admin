@@ -490,7 +490,7 @@ Deno.serve(async (req: Request) => {
     // ── 5. Find an existing account (reconnect, never duplicate) ───────────
     const { data: existing, error: existingError } = await admin
       .from("drive_accounts")
-      .select("id, status, refresh_token_secret_id")
+      .select("id, status, enabled, connection_status, health_status, refresh_token_secret_id")
       .eq("google_email", email)
       .maybeSingle();
 
@@ -510,6 +510,9 @@ Deno.serve(async (req: Request) => {
     const existingRow = existing as {
       id: string;
       status: string | null;
+      enabled: boolean | null;
+      connection_status: string | null;
+      health_status: string | null;
       refresh_token_secret_id: string | null;
     } | null;
 
@@ -552,13 +555,30 @@ Deno.serve(async (req: Request) => {
     let refreshTokenStored = false;
 
     if (existingRow) {
-      // Preserve all other account data — only refresh the reconnect state
-      // using columns that exist in the live drive_accounts schema.
+      // Reconnect the existing row (matched by google_email). Never insert a
+      // second account. Restore connection/health from this proven Drive API
+      // call even when Google omits a new refresh token, so last_error is not
+      // left behind after a successful re-authorization.
       const patch: Record<string, unknown> = {
         updated_at: now,
+        connection_status: "connected",
+        last_error: null,
+        last_error_at: null,
+        last_health_check_at: now,
       };
-      if (existingRow.status === "reauth_required") {
+      const disabled = existingRow.enabled === false ||
+        existingRow.status === "disabled";
+      if (!disabled &&
+        (existingRow.status === "reauth_required" ||
+          existingRow.status === "error")) {
         patch.status = "active";
+      }
+      if (
+        existingRow.health_status === "unhealthy" ||
+        existingRow.health_status === "unknown" ||
+        existingRow.health_status === "degraded"
+      ) {
+        patch.health_status = "healthy";
       }
 
       const { error: updateError } = await admin

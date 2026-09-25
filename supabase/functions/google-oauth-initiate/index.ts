@@ -235,6 +235,27 @@ Deno.serve(async (req: Request) => {
       expiresAt,
     });
 
+    // Optional login_hint from the admin panel's Re-authenticate action.
+    // This only pre-selects the Google account on the consent screen; the
+    // callback still matches the resulting email to an existing drive_accounts
+    // row and never creates a duplicate for that email.
+    let loginHint: string | null = null;
+    try {
+      const rawBody = await req.json();
+      if (
+        rawBody &&
+        typeof rawBody === "object" &&
+        typeof (rawBody as { login_hint?: unknown }).login_hint === "string"
+      ) {
+        const candidate = (rawBody as { login_hint: string }).login_hint.trim();
+        if (candidate.length > 0 && candidate.length <= 320) {
+          loginHint = candidate;
+        }
+      }
+    } catch {
+      // Empty or non-JSON body is the Connect (new account) path.
+    }
+
     // 4. Server-side authorization URL. The redirect target is the Admin Panel
     //    callback page (ADMIN_CALLBACK_URL), which receives ?code=&state= and
     //    forwards them to google-oauth-callback for the server-side exchange.
@@ -247,11 +268,15 @@ Deno.serve(async (req: Request) => {
       prompt: "consent",
       state,
     });
+    if (loginHint) {
+      params.set("login_hint", loginHint);
+    }
 
     log("info", OPERATION, {
       event: "authorization_url_generated",
       result: "success",
       userId,
+      loginHintApplied: Boolean(loginHint),
     });
 
     return json({ url: `${GOOGLE_AUTH_URL}?${params.toString()}` }, 200);

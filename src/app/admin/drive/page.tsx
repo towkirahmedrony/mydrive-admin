@@ -166,6 +166,10 @@ export default async function DriveAccountsPage() {
   const needsAttentionAccounts = accounts.filter(
     (a) =>
       ["reauth_required", "error", "disabled"].includes(a.status ?? "") ||
+      a.health_status === "unhealthy" ||
+      a.connection_status === "reauth_required" ||
+      a.connection_status === "disconnected" ||
+      a.connection_status === "error" ||
       Boolean(a.last_error)
   ).length;
 
@@ -175,7 +179,9 @@ export default async function DriveAccountsPage() {
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Drive Accounts</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Manage Google Drive accounts connected to your My Drive system
+            Manage Google Drive accounts connected to your My Drive system.
+            Connect adds a new account. Re-authenticate refreshes an existing
+            one.
           </p>
         </div>
         <ConnectGoogleDriveButton />

@@ -182,11 +182,36 @@ function classifyInvokeFailure(info: InvokeErrorInfo): FailureClass {
   return "unknown";
 }
 
-export default function ConnectGoogleDriveButton() {
+interface ConnectGoogleDriveButtonProps {
+  /**
+   * `connect` starts a new Google Drive authorization.
+   * `reauthenticate` reuses the same initiate/callback flow for an existing
+   * account. Duplicate rows are avoided because the callback matches on
+   * `google_email` and updates the existing `drive_accounts` row.
+   */
+  mode?: "connect" | "reauthenticate";
+  /** Existing account email, used only as Google's `login_hint`. */
+  googleEmail?: string | null;
+  disabled?: boolean;
+  compact?: boolean;
+  /** `link` matches the card's text actions (Disable / Refresh). */
+  variant?: "button" | "link";
+}
+
+export default function ConnectGoogleDriveButton({
+  mode = "connect",
+  googleEmail = null,
+  disabled = false,
+  compact = false,
+  variant = "button",
+}: ConnectGoogleDriveButtonProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const supabase = createClient();
+  const isReauth = mode === "reauthenticate";
+  const hint =
+    typeof googleEmail === "string" ? googleEmail.trim() : "";
 
   const handleConnect = async () => {
     setLoading(true);
@@ -196,6 +221,8 @@ export default function ConnectGoogleDriveButton() {
     logOAuthInitiate("info", {
       event: "button_clicked",
       functionName: FUNCTION_NAME,
+      mode,
+      hasLoginHint: hint.length > 0,
       resolvedEndpoint: resolveInvokeEndpoint(),
       hasSupabaseUrlInBrowserBundle: Boolean(
         process.env.NEXT_PUBLIC_SUPABASE_URL
@@ -229,6 +256,8 @@ export default function ConnectGoogleDriveButton() {
       logOAuthInitiate("info", {
         event: "invoke_starting",
         functionName: FUNCTION_NAME,
+        mode,
+        hasLoginHint: hint.length > 0,
         resolvedEndpoint: resolveInvokeEndpoint(),
         hasSession: Boolean(session),
       });
@@ -236,7 +265,7 @@ export default function ConnectGoogleDriveButton() {
       const { data, error: invokeError } = await supabase.functions.invoke(
         FUNCTION_NAME,
         {
-          body: {},
+          body: isReauth && hint ? { login_hint: hint } : {},
         }
       );
 
@@ -311,11 +340,25 @@ export default function ConnectGoogleDriveButton() {
       if (data?.url) {
         // Redirect the browser to Google's OAuth consent screen.
         // After authorization, Google redirects back to the admin panel callback page.
+        // The callback reconnects an existing drive_accounts row by google_email
+        // rather than inserting a duplicate.
+        let authorizationUrl = data.url as string;
+        if (isReauth && hint) {
+          try {
+            const parsed = new URL(authorizationUrl);
+            parsed.searchParams.set("login_hint", hint);
+            authorizationUrl = parsed.toString();
+          } catch {
+            // Keep the server URL if it is not parseable.
+          }
+        }
         logOAuthInitiate("info", {
           event: "authorization_url_received",
           result: "success",
+          mode,
+          loginHintApplied: isReauth && hint.length > 0,
         });
-        window.location.href = data.url;
+        window.location.href = authorizationUrl;
       } else {
         logOAuthInitiate("error", {
           event: "authorization_url_received",
@@ -337,12 +380,22 @@ export default function ConnectGoogleDriveButton() {
     }
   };
 
+  const idleLabel = isReauth ? "Re-authenticate" : "Connect Google Drive";
+  const busyLabel = isReauth ? "Re-authenticating..." : "Connecting...";
+  const buttonClass =
+    variant === "link"
+      ? "text-sm text-primary-600 hover:text-primary-800 disabled:opacity-50 transition-colors"
+      : compact
+      ? "inline-flex items-center px-3 py-1.5 border border-transparent text-sm font-medium rounded-md text-white bg-orange-600 hover:bg-orange-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-orange-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+      : "inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors";
+
   return (
     <div>
       <button
+        type="button"
         onClick={handleConnect}
-        disabled={loading}
-        className="inline-flex items-center px-4 py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-primary-600 hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+        disabled={loading || disabled}
+        className={buttonClass}
       >
         {loading ? (
           <>
@@ -365,12 +418,12 @@ export default function ConnectGoogleDriveButton() {
                 d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
               />
             </svg>
-            Connecting...
+            {busyLabel}
           </>
         ) : (
           <>
-            <span className="mr-2">+</span>
-            Connect Google Drive
+            {!isReauth && variant !== "link" && <span className="mr-2">+</span>}
+            {idleLabel}
           </>
         )}
       </button>

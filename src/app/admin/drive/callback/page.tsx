@@ -162,9 +162,9 @@ function OAuthCallbackContent() {
           });
           setStatus("success");
           setMessage(
-            `Google Drive account ${data.email ? `(${data.email})` : ""} connected successfully!`
+            `Google Drive account ${data.email ? `(${data.email})` : ""} connected successfully. Reloading account state from the server...`
           );
-          // Refresh the account list, then return to the Drive Accounts page.
+          // Do not assume local success: reload Drive accounts from drive-admin.
           setTimeout(() => {
             router.refresh();
             router.push("/admin/drive");
